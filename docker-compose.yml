@@ -1,0 +1,50 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: vod-db
+    environment:
+      POSTGRES_USER: vod_user
+      POSTGRES_PASSWORD: vod_password
+      POSTGRES_DB: vod_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vod_user -d vod_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: vod-redis
+    # Habilitar persistencia en Redis (AOF y RDB)
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  nginx:
+    image: nginx:alpine
+    container_name: vod-nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./storage/output:/usr/share/nginx/html:ro
+      - ./storage/progressive:/storage_progressive:ro
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # Los certs irían aquí, pero para MVP local mapeamos el puerto 80 sin cert
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:

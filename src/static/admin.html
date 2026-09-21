@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>VOD Control Room</title>
+  <link rel="stylesheet" href="/admin-static/admin.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">V</span><span>VOD Control Room</span></div>
+      <div class="top-actions">
+        <span id="updatedAt" class="updated">Sin conectar</span>
+        <button id="refreshButton" class="button ghost" type="button">Actualizar</button>
+        <button id="logoutButton" class="button ghost hidden" type="button">Cerrar sesión</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hidden"></div>
+        <div id="systemState" class="system-state neutral"><span class="pulse"></span><span>Esperando conexión</span></div>
+      </section>
+
+      <section id="loginPanel" class="login-panel">
+        <div>
+          <p class="eyebrow">ACCESO RESTRINGIDO</p>
+          <h2>Conecta la consola</h2>
+          <p>Ingresa la clave administrativa configurada para este entorno.</p>
+        </div>
+        <form id="loginForm">
+          <label for="adminKey">Clave administrativa</label>
+          <div class="input-row">
+            <input id="adminKey" type="password" autocomplete="current-password" required placeholder="••••••••••••">
+            <button class="button primary" type="submit">Conectar</button>
+          </div>
+          <p id="loginError" class="error" role="alert"></p>
+        </form>
+      </section>
+
+      <div id="dashboard" class="hidden">
+        <section class="metric-grid" aria-label="Resumen operativo">
+          <article class="metric"><p>Listos</p><strong id="readyCount">0</strong><span>assets publicados</span><button id="viewReadyBtn" class="button ghost">Ver listos</button></article>
+          <article class="metric"><p>En proceso</p><strong id="processingCount">0</strong><span>incluye cola y validación</span></article>
+          <article class="metric alert"><p>Fallidos</p><strong id="failedCount">0</strong><span>requieren revisión</span></article>
+          <article class="metric"><p>Progreso de cola</p><strong id="queueDepth">0</strong><span>trabajos esperando</span></article>
+        </section>
+
+        <section class="operations-grid">
+          <article class="panel pipeline-panel">
+            <div class="panel-heading"><div><p class="eyebrow">PIPELINE</p><h2>Distribución de assets</h2></div></div>
+            <div id="statusBars" class="status-bars"></div>
+          </article>
+          <article class="panel capacity-panel">
+            <div class="panel-heading"><div><p class="eyebrow">CAPACIDAD</p><h2>Cola y workers</h2></div></div>
+            <div class="capacity-display">
+              <div><strong id="workerCount">0</strong><span>workers</span></div>
+              <div><strong id="staleCount">0</strong><span>estancados</span></div>
+            </div>
+            <p id="capacityMessage" class="capacity-message">Calculando capacidad…</p>
+          </article>
+        </section>
+
+        <section id="processingPanel" class="panel failures-panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">EN CURSO</p><h2>Videos en proceso</h2></div>
+            <span id="processingTotal" class="counter">0 activos</span>
+          </div>
+          <div id="emptyProcessing" class="empty-state hidden">No hay videos en proceso.</div>
+          <div id="processingList" class="failure-list"></div>
+        </section>
+
+        <section class="panel failures-panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">ATENCIÓN</p><h2>Fallos recientes</h2></div>
+            <span id="failureTotal" class="counter">0 incidentes</span>
+          </div>
+          <div id="emptyFailures" class="empty-state hidden">No hay fallos recientes. El pipeline está limpio.</div>
+          <div id="failureList" class="failure-list"></div>
+        </section>
+
+        <section id="readyPanel" class="panel failures-panel hidden">
+          <div class="panel-heading">
+            <div><p class="eyebrow">COMPLETADOS</p><h2>Videos listos</h2></div>
+            <span id="readyTotal" class="counter">0 listos</span>
+          </div>
+          <div id="emptyReady" class="empty-state hidden">No hay videos listos.</div>
+          <div id="readyList" class="failure-list"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <div id="detailsModal" class="modal hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="modalTitle">Detalles del Video</h3>
+        <button id="closeModalBtn" class="button ghost">Cerrar</button>
+      </div>
+      <div id="modalBody" class="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/admin-static/admin.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vod"
+version = "0.1.0"
+description = "VOD MVP"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.100",
+    "uvicorn>=0.23",
+    "sqlalchemy>=2.0",
+    "alembic>=1.11",
+    "psycopg[binary]>=3.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "redis>=5.0",
+    "rq>=1.15"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "httpx",
+    "sqlalchemy-utils"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools]
+packages = ["src", "src.api", "src.core", "src.models", "src.schemas", "src.worker", "src.scripts"]
+
+[tool.setuptools.package-data]
+src = ["static/*.html", "static/*.css", "static/*.js"]

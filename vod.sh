@@ -1,0 +1,677 @@
+#!/bin/bash
+
+# VOD MVP Management Script
+# ==============================================================================
+
+# Cambiar al directorio donde reside el script (raíz del proyecto)
+cd "$(dirname "$0")" || exit 1
+
+# ==============================================================================
+# Configuración y Variables
+# ==============================================================================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+RUN_DIR="storage/run"
+LOGS_DIR="storage/logs/services"
+API_PID_FILE="$RUN_DIR/api.pid"
+WORKER_PID_FILE="$RUN_DIR/worker.pid"
+API_LOG_FILE="$LOGS_DIR/api.log"
+WORKER_LOG_FILE="$LOGS_DIR/worker.log"
+
+ALLOWED_EXTENSIONS=(".mp4" ".mov" ".mkv" ".mxf" ".avi" ".m4v")
+
+# Extraer INGEST_ROOT del .env o default
+if [ -f .env ]; then
+    INGEST_ROOT=$(grep -E "^INGEST_ROOT=" .env | cut -d '=' -f2 | tr -d '"' | tr -d "'")
+fi
+INGEST_ROOT=${INGEST_ROOT:-storage/input}
+INGEST_ROOT=$(echo "$INGEST_ROOT" | sed 's/^\.\///') # Limpiar ./ inicial si existe
+
+# ==============================================================================
+# Funciones Auxiliares
+# ==============================================================================
+info() { echo -e "${CYAN}[INFO]${NC} $1"; }
+success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1"; }
+die() { error "$1"; exit 1; }
+
+check_deps() {
+    # Check docker & docker compose
+    if ! command -v docker >/dev/null 2>&1; then
+        die "Docker no está instalado o no está en el PATH."
+    fi
+    if ! docker compose version >/dev/null 2>&1 && ! docker-compose --version >/dev/null 2>&1; then
+        die "Docker Compose no está instalado."
+    fi
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        die "FFmpeg no está instalado."
+    fi
+    if ! command -v ffprobe >/dev/null 2>&1; then
+        die "FFprobe no está instalado."
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        die "Python3 no está instalado."
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        die "curl no está instalado."
+    fi
+
+    # Check venv
+    if [ -d ".venv" ]; then
+        VENV_BIN=".venv/bin"
+        VENV_PYTHON=".venv/bin/python"
+        export PATH="$PWD/$VENV_BIN:$PATH"
+    elif [ -d "venv" ]; then
+        VENV_BIN="venv/bin"
+        VENV_PYTHON="venv/bin/python"
+        export PATH="$PWD/$VENV_BIN:$PATH"
+    else
+        die "No se encontró entorno virtual (.venv o venv). Cree uno e instale dependencias antes de iniciar."
+    fi
+}
+
+get_docker_compose_cmd() {
+    if docker compose version >/dev/null 2>&1; then
+        echo "docker compose"
+    else
+        echo "docker-compose"
+    fi
+}
+
+check_pid_running() {
+    local pid_file=$1
+    local process_pattern=$2
+    if [ -f "$pid_file" ]; then
+        local pid=$(cat "$pid_file")
+        if kill -0 "$pid" 2>/dev/null; then
+            if ps -p "$pid" -o command= | grep -E "$process_pattern" >/dev/null 2>&1; then
+                return 0 # Está corriendo
+            fi
+        fi
+        # PID obsoleto
+        rm -f "$pid_file"
+    fi
+    return 1 # No está corriendo
+}
+
+graceful_kill() {
+    local pid_file=$1
+    local process_pattern=$2
+    if check_pid_running "$pid_file" "$process_pattern"; then
+        local pid=$(cat "$pid_file")
+        info "Deteniendo proceso $pid ($process_pattern)..."
+        kill -TERM "$pid"
+        
+        # Wait up to 5 seconds
+        for i in {1..5}; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                success "Proceso $pid detenido correctamente."
+                rm -f "$pid_file"
+                return 0
+            fi
+            sleep 1
+        done
+        
+        warning "Proceso $pid no respondió a SIGTERM. Enviando SIGKILL..."
+        kill -KILL "$pid" 2>/dev/null
+        rm -f "$pid_file"
+        success "Proceso $pid eliminado forzosamente."
+    else
+        # info "El proceso de $pid_file no está activo."
+        rm -f "$pid_file"
+    fi
+}
+
+wait_for_db_redis() {
+    local dc_cmd=$(get_docker_compose_cmd)
+    local max_retries=${VOD_HEALTH_RETRIES:-15}
+    local wait_seconds=${VOD_HEALTH_INTERVAL:-1}
+    local db_ok=0
+    local redis_ok=0
+    
+    for ((i=1; i<=max_retries; i++)); do
+        if [ "$db_ok" -eq 0 ]; then
+            if $dc_cmd exec -T db pg_isready -U vod_user -d vod_db >/dev/null 2>&1; then
+                db_ok=1
+            fi
+        fi
+        if [ "$redis_ok" -eq 0 ]; then
+            if $dc_cmd exec -T redis redis-cli ping >/dev/null 2>&1; then
+                redis_ok=1
+            fi
+        fi
+        
+        if [ "$db_ok" -eq 1 ] && [ "$redis_ok" -eq 1 ]; then
+            return 0
+        fi
+        sleep $wait_seconds
+    done
+    return 1
+}
+
+# ==============================================================================
+# Comandos principales
+# ==============================================================================
+cmd_start() {
+    check_deps
+    
+    mkdir -p "$RUN_DIR" "$LOGS_DIR" "$INGEST_ROOT"
+    
+    local api_started_this_run=0
+    local worker_started_this_run=0
+
+    # Docker Compose (Always ensure containers are up)
+    info "Iniciando contenedores Docker..."
+    local dc_cmd=$(get_docker_compose_cmd)
+    $dc_cmd up -d || die "Error iniciando contenedores."
+    
+    info "Esperando disponibilidad de PostgreSQL y Redis..."
+    if ! wait_for_db_redis; then
+        die "Tiempo de espera agotado para DB/Redis."
+    fi
+    success "Bases de datos listas."
+
+    # Migraciones siempre corren para asegurar esquema fresco
+    echo -n "Ejecutando migraciones... "
+    if alembic upgrade head > "$LOGS_DIR/alembic.log" 2>&1; then
+        success "Migraciones completadas"
+    else
+        echo -e "${RED}[ERROR]${NC} Fallaron las migraciones."
+        return 1
+    fi
+
+    # Iniciar API si no corre
+    if check_pid_running "$API_PID_FILE" "uvicorn"; then
+        warning "La API ya estaba iniciada (PID: $(cat $API_PID_FILE))."
+    else
+        echo -n "Iniciando API... "
+        uvicorn src.main:app --host 0.0.0.0 --port 8000 > "$API_LOG_FILE" 2>&1 &
+        echo $! > "$API_PID_FILE"
+        api_started_this_run=1
+        success "API iniciada (PID: $(cat $API_PID_FILE))"
+    fi
+    if check_pid_running "$WORKER_PID_FILE" "run_worker"; then
+        warning "El worker ya estaba iniciado (PID: $(cat $WORKER_PID_FILE))."
+    else
+        echo -n "Iniciando Worker... "
+        "$VENV_PYTHON" src/scripts/run_worker.py > "$WORKER_LOG_FILE" 2>&1 &
+        echo $! > "$WORKER_PID_FILE"
+        worker_started_this_run=1
+        success "Worker iniciado (PID: $(cat $WORKER_PID_FILE))"
+    fi
+
+    # Check API health
+    info "Esperando comprobaciones de salud de la API..."
+    local max_retries=${VOD_HEALTH_RETRIES:-15}
+    local wait=${VOD_HEALTH_INTERVAL:-1}
+    local health_ok=0
+
+    # Python script para leer y parsear json recibido por argumentos
+    local health_script=$(cat << 'EOF'
+import sys, json
+try:
+    live = json.loads(sys.argv[1])
+    ready = json.loads(sys.argv[2])
+    if live.get("status") == "alive" and ready.get("status") == "ready":
+        sys.exit(0)
+    sys.exit(1)
+except Exception:
+    sys.exit(1)
+EOF
+)
+
+    for ((i=1; i<=max_retries; i++)); do
+        local live_resp=$(curl -s http://localhost:8000/health/live || echo "{}")
+        local ready_resp=$(curl -s http://localhost:8000/health/ready || echo "{}")
+        if "$VENV_PYTHON" -c "$health_script" "$live_resp" "$ready_resp" 2>/dev/null; then
+            health_ok=1
+            break
+        fi
+        sleep $wait
+    done
+
+    if [ "$health_ok" -eq 0 ]; then
+        error "Healthcheck de la API falló. Revisar logs en $API_LOG_FILE"
+        
+        # Rollback de lo que iniciamos
+        info "Iniciando Rollback de procesos..."
+        if [ "$api_started_this_run" -eq 1 ]; then
+            graceful_kill "$API_PID_FILE" "uvicorn"
+        fi
+        if [ "$worker_started_this_run" -eq 1 ]; then
+            graceful_kill "$WORKER_PID_FILE" "run_worker"
+        fi
+        exit 1
+    fi
+
+    # Check Worker health
+    info "Esperando comprobaciones de salud del Worker..."
+    local worker_health_script=$(cat << 'EOF'
+import sys, time
+from redis import Redis
+from rq import Worker
+from src.core.config import settings
+
+redis_conn = Redis.from_url(settings.REDIS_URL)
+queue_name = settings.RQ_QUEUE_NAME
+
+for _ in range(15):
+    workers = Worker.all(connection=redis_conn)
+    for w in workers:
+        if queue_name in w.queue_names():
+            print(queue_name)
+            sys.exit(0)
+    time.sleep(1)
+sys.exit(1)
+EOF
+)
+    local worker_queue
+    if worker_queue=$("$VENV_PYTHON" -c "$worker_health_script" 2>/dev/null); then
+        success "Worker escuchando en la cola: $worker_queue"
+    else
+        error "Healthcheck del Worker falló. No se detectó worker escuchando en la cola correcta."
+        
+        # Rollback de lo que iniciamos
+        info "Iniciando Rollback de procesos..."
+        if [ "$api_started_this_run" -eq 1 ]; then
+            graceful_kill "$API_PID_FILE" "uvicorn"
+        fi
+        if [ "$worker_started_this_run" -eq 1 ]; then
+            graceful_kill "$WORKER_PID_FILE" "run_worker"
+        fi
+        exit 1
+    fi
+
+    echo ""
+    success "==========================================================="
+    success " Sistema VOD inicializado correctamente."
+    success "==========================================================="
+    echo -e "API Base:    ${CYAN}http://localhost:8000${NC}"
+    echo -e "Swagger UI:  ${CYAN}http://localhost:8000/docs${NC}"
+    echo -e "Nginx / HLS: ${CYAN}http://localhost:8080${NC}"
+    echo ""
+    cmd_status
+}
+
+cmd_stop() {
+    info "Deteniendo servicios VOD..."
+    graceful_kill "$WORKER_PID_FILE" "run_worker"
+    graceful_kill "$API_PID_FILE" "uvicorn"
+    
+    info "Deteniendo contenedores Docker..."
+    local dc_cmd=$(get_docker_compose_cmd)
+    if [ -n "$dc_cmd" ]; then
+        $dc_cmd down || warning "Error al ejecutar docker compose down."
+    fi
+    success "Todos los servicios han sido detenidos."
+}
+
+cmd_status() {
+    check_deps
+    
+    echo -e "\n${CYAN}--- ESTADO DE SERVICIOS ---${NC}"
+    local dc_cmd=$(get_docker_compose_cmd)
+    if [ "$dc_cmd" = "docker compose" ]; then
+        $dc_cmd ps --format "table {{.Service}}\t{{.Status}}\t{{.Ports}}"
+    else
+        $dc_cmd ps
+    fi
+
+    echo -e "\n${CYAN}--- ESTADO DE PROCESOS ---${NC}"
+    if check_pid_running "$API_PID_FILE" "uvicorn"; then
+        echo -e "API:    ${GREEN}Corriendo${NC} (PID: $(cat $API_PID_FILE))"
+    else
+        echo -e "API:    ${RED}Detenida${NC}"
+    fi
+
+    if check_pid_running "$WORKER_PID_FILE" "run_worker"; then
+        echo -e "Worker: ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_PID_FILE))"
+    else
+        echo -e "Worker: ${RED}Detenida${NC}"
+    fi
+
+    echo -e "\n${CYAN}--- HEALTHCHECKS ---${NC}"
+    local live_http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health/live || echo "000")
+    local ready_http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health/ready || echo "000")
+
+    if [ "$live_http_code" = "200" ]; then
+        echo -e "Live:   ${GREEN}OK${NC}"
+    else
+        echo -e "Live:   ${RED}FAIL ($live_http_code)${NC}"
+    fi
+
+    if [ "$ready_http_code" = "200" ]; then
+        echo -e "Ready:  ${GREEN}OK${NC}"
+    else
+        echo -e "Ready:  ${RED}FAIL ($ready_http_code)${NC}"
+    fi
+
+    # Cola de trabajos RQ
+    echo -e "\n${CYAN}--- JOBS EN COLA (RQ) ---${NC}"
+    local rq_script=$(cat << 'EOF'
+import sys
+from redis import Redis
+from rq import Queue
+try:
+    from src.core.config import settings
+    redis_conn = Redis.from_url(settings.REDIS_URL)
+    q = Queue(name=settings.RQ_QUEUE_NAME, connection=redis_conn)
+    print(f"Queued:  {q.count}")
+    print(f"Started: {q.started_job_registry.count}")
+    print(f"Failed:  {q.failed_job_registry.count}")
+except Exception as e:
+    print(f"Error consultando Redis/RQ: {e}")
+EOF
+)
+    "$VENV_PYTHON" -c "$rq_script" 2>/dev/null || echo "No disponible."
+    echo ""
+}
+
+cmd_logs() {
+    local follow=$1
+    local files=""
+    if [ -f "$API_LOG_FILE" ]; then
+        files="$files $API_LOG_FILE"
+    fi
+    if [ -f "$WORKER_LOG_FILE" ]; then
+        files="$files $WORKER_LOG_FILE"
+    fi
+
+    if [ -z "$files" ]; then
+        error "No existen archivos de log todavía."
+        return 0
+    fi
+
+    if [ "$follow" = "--follow" ] || [ "$follow" = "-f" ]; then
+        tail -f $files
+    else
+        tail -n 50 $files
+    fi
+}
+
+validate_extension() {
+    local ext=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+    for allowed in "${ALLOWED_EXTENSIONS[@]}"; do
+        if [ "$ext" = "$allowed" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+derive_enlace_id() {
+    local base_name=$(basename "$1")
+    # Extraer la extensión ignorando hidden files
+    local ext=".${base_name##*.}"
+    local name_no_ext="${base_name%.*}"
+    
+    if [ "$ext" = ".$base_name" ]; then
+        ext=""
+        name_no_ext="$base_name"
+    fi
+
+    if [ -n "$ext" ]; then
+        if validate_extension "$ext"; then
+            echo "$name_no_ext"
+            return 0
+        fi
+        return 1
+    fi
+    
+    echo "$base_name"
+    return 0
+}
+
+process_single_ingest() {
+    local source_uri=$1
+
+    if [[ "$source_uri" == /* ]]; then
+        error "source_uri no puede ser absoluto: $source_uri"
+        return 1
+    fi
+    if [[ "$source_uri" == ".." ]] || [[ "$source_uri" == "../"* ]] || [[ "$source_uri" == *"/.." ]] || [[ "$source_uri" == *"/../"* ]]; then
+        error "source_uri no puede contener componentes '..': $source_uri"
+        return 1
+    fi
+
+    local physical_file="$INGEST_ROOT/$source_uri"
+
+    # Verificación estricta de Path con Python
+    local path_script=$(cat << 'EOF'
+import sys, os
+from pathlib import Path
+try:
+    root = Path(sys.argv[1]).resolve()
+    # normpath normalises '..' without resolving symlinks
+    norm_str = os.path.normpath(os.path.join(os.getcwd(), sys.argv[2]))
+    target = Path(norm_str)
+
+    try:
+        target.relative_to(root)
+    except ValueError:
+        print("FUERA_DE_RAIZ")
+        sys.exit(1)
+
+    # Check every path component from root down to target for symlinks
+    current = target
+    while True:
+        if current.is_symlink():
+            print("SYMLINK")
+            sys.exit(1)
+        if current == root:
+            break
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+    if not target.is_file():
+        print("NO_ES_ARCHIVO_REGULAR")
+        sys.exit(1)
+
+    print("OK")
+    sys.exit(0)
+except Exception as e:
+    print(e)
+    sys.exit(1)
+EOF
+)
+    
+    local path_res
+    if ! path_res=$("$VENV_PYTHON" -c "$path_script" "$INGEST_ROOT" "$physical_file"); then
+        error "Validación de ruta falló ($path_res): $source_uri"
+        return 1
+    fi
+
+    local derived_id
+    if ! derived_id=$(derive_enlace_id "$source_uri"); then
+        error "Extensión no permitida para el archivo: $source_uri"
+        return 1
+    fi
+
+    if [ -z "$derived_id" ]; then
+        error "Identificador derivado vacío: $source_uri"
+        return 1
+    fi
+
+    if ! [[ "$derived_id" =~ ^[A-Za-z0-9_-]{1,128}$ ]]; then
+        error "Identificador '$derived_id' inválido (caracteres no permitidos o longitud incorrecta)."
+        return 1
+    fi
+
+    local live_http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health/live || echo "000")
+    if [ "$live_http_code" != "200" ]; then
+        error "La API no está lista. Asegúrese de ejecutar './vod.sh start' primero."
+        return 1
+    fi
+
+    info "Ingestando: [ID: $derived_id] -> [URI: $source_uri]"
+
+    # Json payload builder con Python (para escapar comillas, espacios, etc.)
+    local payload_script=$(cat << 'EOF'
+import sys, json
+print(json.dumps({"enlace_id": sys.argv[1], "source_uri": sys.argv[2]}))
+EOF
+)
+    local json_payload
+    json_payload=$("$VENV_PYTHON" -c "$payload_script" "$derived_id" "$source_uri")
+
+    local response=$(curl -s -w "\n%{http_code}" -X POST "http://localhost:8000/api/v1/assets" \
+         -H "Content-Type: application/json" \
+         -d "$json_payload")
+
+    local http_code=$(echo "$response" | tail -n 1)
+    local body=$(echo "$response" | sed '$d')
+
+    if [ "$http_code" = "201" ]; then
+        success "Registrado correctamente. Respuesta:"
+        echo "$body"
+        return 0
+    elif [ "$http_code" = "200" ]; then
+        # 200 significa que fue reutilizado en el backend
+        warning "Activo reutilizado (ya existía). Respuesta:"
+        echo "$body"
+        # Para ingest individual, 200 sigue siendo éxito (exit 0 al final).
+        return 2
+    else
+        error "Fallo al registrar (HTTP $http_code). Respuesta:"
+        echo "$body"
+        return 3
+    fi
+}
+
+cmd_ingest() {
+    check_deps
+    
+    if [ -z "$1" ]; then
+        die "Uso: ./vod.sh ingest <SOURCE_URI>"
+    fi
+    
+    process_single_ingest "$1"
+    local ret=$?
+    
+    # 0 = 201 Created
+    # 2 = 200 Reused
+    if [ $ret -eq 0 ] || [ $ret -eq 2 ]; then
+        exit 0
+    else
+        exit 1
+    fi
+}
+
+cmd_ingest_all() {
+    check_deps
+    
+    local live_http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health/live || echo "000")
+    if [ "$live_http_code" != "200" ]; then
+        die "La API no está lista. Asegúrese de ejecutar './vod.sh start' primero."
+    fi
+
+    if [ ! -d "$INGEST_ROOT" ]; then
+        die "El directorio $INGEST_ROOT no existe."
+    fi
+
+    info "Escaneando $INGEST_ROOT en busca de archivos (no se siguen symlinks)..."
+
+    local total_files=0
+    local registered=0
+    local reused=0
+    local rejected=0
+    local failed=0
+
+    # find files recursively, avoiding symlinks, process substitution
+    while IFS= read -r -d '' file; do
+        ((total_files++))
+        local relative_path="${file#"$INGEST_ROOT/"}"
+        
+        process_single_ingest "$relative_path"
+        local ret=$?
+        
+        if [ $ret -eq 0 ]; then
+            ((registered++))
+        elif [ $ret -eq 2 ]; then
+            ((reused++))
+        elif [ $ret -eq 1 ]; then
+            ((rejected++))
+        else
+            ((failed++))
+        fi
+        echo "---"
+    done < <(find "$INGEST_ROOT" -type f -not -type l -print0)
+
+    echo -e "\n${CYAN}--- RESUMEN DE INGESTIÓN ---${NC}"
+    echo "Archivos escaneados: $total_files"
+    echo -e "Registrados:       ${GREEN}$registered${NC}"
+    echo -e "Reutilizados:      ${YELLOW}$reused${NC}"
+    echo -e "Rechazados:        ${RED}$rejected${NC}"
+    echo -e "Fallidos:          ${RED}$failed${NC}"
+}
+
+cmd_help() {
+    echo -e "${CYAN}VOD MVP Management Script${NC}"
+    echo "========================="
+    echo "Uso: ./vod.sh <comando> [argumentos]"
+    echo ""
+    echo "Comandos:"
+    echo "  start       Inicializa bases de datos, migraciones, API y Worker."
+    echo "  stop        Detiene la API, el Worker y la base de datos de manera segura."
+    echo "  restart     Ejecuta stop y luego start."
+    echo "  status      Muestra el estado de contenedores, procesos, colas y salud."
+    echo "  logs        Muestra las últimas 50 líneas de los logs operativos."
+    echo "  logs -f     Sigue en tiempo real los logs operativos (--follow)."
+    echo "  ingest      Registra un archivo de origen. Uso: ./vod.sh ingest <SOURCE_URI>"
+    echo "              (Ej: ./vod.sh ingest programas/PREDI-MVIDA464.mp4)"
+    echo "  ingest-all  Escanea y registra todos los archivos válidos en INGEST_ROOT."
+    echo ""
+    echo "Ejemplo completo:"
+    echo "  cp /ruta/del/video/PREDI-MVIDA464.mp4 storage/input/"
+    echo "  ./vod.sh start"
+    echo "  ./vod.sh ingest PREDI-MVIDA464.mp4"
+    echo "  ./vod.sh status"
+    echo "  ./vod.sh stop"
+}
+
+# ==============================================================================
+# Entrypoint
+# ==============================================================================
+COMMAND=$1
+shift
+
+case "$COMMAND" in
+    start)
+        cmd_start
+        ;;
+    stop)
+        cmd_stop
+        ;;
+    restart)
+        cmd_stop
+        sleep 2
+        cmd_start
+        ;;
+    status)
+        cmd_status
+        ;;
+    logs)
+        cmd_logs "$@"
+        ;;
+    ingest)
+        cmd_ingest "$@"
+        ;;
+    ingest-all)
+        cmd_ingest_all
+        ;;
+    help|"")
+        cmd_help
+        ;;
+    *)
+        error "Comando desconocido: $COMMAND"
+        cmd_help
+        exit 1
+        ;;
+esac
