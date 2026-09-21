@@ -62,12 +62,15 @@ def test_admin_dashboard(mock_redis, mock_queue, mock_workers, admin_key):
     mock_queue.return_value.count = 3
     response = client.get("/api/v1/admin/dashboard", headers=admin_key)
     assert response.status_code == 200
-    assert response.json()["queue"] == {
-        "name": settings.RQ_QUEUE_NAME,
-        "depth": 3,
-        "workers": 0,
-        "stale_jobs": 0,
-    }
+    q_data = response.json()["queue"]
+    assert q_data["name"] == settings.RQ_QUEUE_NAME
+    assert q_data["depth"] == 3
+    assert q_data["workers"] == 0
+    assert q_data["stale_jobs"] == 0
+    assert q_data["legacy_queue_depth"] == 3
+    assert q_data["priority_queue_depth"] == 3
+    assert q_data["batch_queue_depth"] == 3
+    assert q_data["total_queue_depth"] == 9
 
 def test_admin_assets_expanded_fields_and_playback_url(admin_key, db_session):
     from src.models.asset import Asset
