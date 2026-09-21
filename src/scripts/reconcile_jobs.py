@@ -17,7 +17,7 @@ from src.core.config import settings
 from src.models.job import Job
 from src.models.asset import Asset
 from src.models.asset_event import AssetEvent
-from src.models.enums import JobStatus, VideoStatus, EventType
+from src.models.enums import JobStatus, VideoStatus, EventType, JobType
 from src.core.state import transition_asset, fail_asset
 
 logging.basicConfig(level=logging.INFO)
@@ -245,12 +245,24 @@ def reconcile_jobs():
             if redis_status == 'missing':
                 logger.warning(f"Job {job.id} not found in Redis.")
                 if job.status == JobStatus.PENDING:
-                    logger.info(f"Re-enqueueing PENDING job {job.id}")
-                    new_rq_job = q.enqueue(
-                        "src.worker.tasks.probe_and_prepare_job",
+                    target_queue = job.queue_name if getattr(job, "queue_name", None) else settings.RQ_QUEUE_NAME
+                    logger.info(f"Re-enqueueing PENDING job {job.id} to queue '{target_queue}'")
+                    task_func = (
+                        "src.worker.tasks.progressive_transcode_asset_job"
+                        if target_queue in ("vod_priority", "vod_batch") or job.type == JobType.TRANSCODE
+                        else "src.worker.tasks.probe_and_prepare_job"
+                    )
+                    timeout = (
+                        settings.FFMPEG_TIMEOUT_SECONDS + 300
+                        if job.type == JobType.TRANSCODE
+                        else settings.RQ_JOB_TIMEOUT_SECONDS
+                    )
+                    target_q = Queue(name=target_queue, connection=redis_conn)
+                    new_rq_job = target_q.enqueue(
+                        task_func,
                         args=(job.id,),
                         job_id=str(job.id),
-                        job_timeout=settings.RQ_JOB_TIMEOUT_SECONDS,
+                        job_timeout=timeout,
                         result_ttl=86400
                     )
                     job.rq_job_id = new_rq_job.id
@@ -291,7 +303,7 @@ def reconcile_jobs():
                 fail_stuck_job(db, job, asset, f"RQ Job {redis_status}")
                 
         except Exception as e:
-            logger.error(f"Error applying reconciliation for job {job_id}: {e}")
+            logger.error(f"Error applying reconciliation for job {current_job_id}: {e}")
             db.rollback()
         finally:
             db.close()

@@ -84,8 +84,12 @@ def _calculate_metrics(asset: Asset) -> dict:
 
 @router.get("/dashboard")
 def dashboard(db: Session = Depends(get_db)):
+    from src.core.queues import QUEUE_LEGACY, QUEUE_PRIORITY, QUEUE_BATCH
     redis_conn = Redis.from_url(settings.REDIS_URL)
-    queue = Queue(name=settings.RQ_QUEUE_NAME, connection=redis_conn)
+    legacy_q = Queue(name=QUEUE_LEGACY, connection=redis_conn)
+    priority_q = Queue(name=QUEUE_PRIORITY, connection=redis_conn)
+    batch_q = Queue(name=QUEUE_BATCH, connection=redis_conn)
+
     workers = Worker.all(connection=redis_conn)
     stale_before = datetime.now(timezone.utc) - timedelta(
         seconds=settings.RQ_JOB_TIMEOUT_SECONDS * 2
@@ -99,13 +103,19 @@ def dashboard(db: Session = Depends(get_db)):
         Asset.status == VideoStatus.FAILED
     ).order_by(Asset.updated_at.desc()).limit(10).all()
 
+    total_depth = legacy_q.count + priority_q.count + batch_q.count
+
     return {
         "generated_at": datetime.now(timezone.utc),
         "assets": _enum_counts(db, Asset, Asset.status),
         "jobs": _enum_counts(db, Job, Job.status),
         "queue": {
             "name": settings.RQ_QUEUE_NAME,
-            "depth": queue.count,
+            "depth": legacy_q.count,
+            "legacy_queue_depth": legacy_q.count,
+            "priority_queue_depth": priority_q.count,
+            "batch_queue_depth": batch_q.count,
+            "total_queue_depth": total_depth,
             "workers": len(workers),
             "stale_jobs": stale_jobs,
         },
@@ -198,6 +208,7 @@ def list_jobs(
                 "status": job.status,
                 "attempt": job.attempt,
                 "worker_id": job.worker_id,
+                "queue_name": getattr(job, "queue_name", "vod_tasks"),
                 "heartbeat": job.heartbeat,
                 "error_code": job.error_code,
                 "error_message": job.error_message,
