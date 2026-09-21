@@ -616,21 +616,28 @@ cmd_ingest_all() {
     echo -e "Fallidos:          ${RED}$failed${NC}"
 }
 
+cmd_catalog_import() {
+    check_deps
+    "$VENV_PYTHON" -m src.scripts.catalog_import "$@"
+}
+
 cmd_help() {
     echo -e "${CYAN}VOD MVP Management Script${NC}"
     echo "========================="
     echo "Uso: ./vod.sh <comando> [argumentos]"
     echo ""
     echo "Comandos:"
-    echo "  start       Inicializa bases de datos, migraciones, API y Worker."
-    echo "  stop        Detiene la API, el Worker y la base de datos de manera segura."
-    echo "  restart     Ejecuta stop y luego start."
-    echo "  status      Muestra el estado de contenedores, procesos, colas y salud."
-    echo "  logs        Muestra las últimas 50 líneas de los logs operativos."
-    echo "  logs -f     Sigue en tiempo real los logs operativos (--follow)."
-    echo "  ingest      Registra un archivo de origen. Uso: ./vod.sh ingest <SOURCE_URI>"
-    echo "              (Ej: ./vod.sh ingest programas/PREDI-MVIDA464.mp4)"
-    echo "  ingest-all  Escanea y registra todos los archivos válidos en INGEST_ROOT."
+    echo "  start           Inicializa bases de datos, migraciones, API y Worker."
+    echo "  stop            Detiene la API, el Worker y la base de datos de manera segura."
+    echo "  restart         Ejecuta stop y luego start."
+    echo "  status          Muestra el estado de contenedores, procesos, colas y salud."
+    echo "  logs            Muestra las últimas 50 líneas de los logs operativos."
+    echo "  logs -f         Sigue en tiempo real los logs operativos (--follow)."
+    echo "  ingest          Registra un archivo de origen. Uso: ./vod.sh ingest <SOURCE_URI>"
+    echo "                  (Ej: ./vod.sh ingest programas/PREDI-MVIDA464.mp4)"
+    echo "  ingest-all      Escanea y registra todos los archivos válidos en INGEST_ROOT."
+    echo "  catalog-import  Registro masivo del catálogo como assets COLD sin transcodificar."
+    echo "                  Uso: ./vod.sh catalog-import [--dry-run] [--limit N] [--root PATH]"
     echo ""
     echo "Ejemplo completo:"
     echo "  cp /ruta/del/video/PREDI-MVIDA464.mp4 storage/input/"
@@ -669,6 +676,9 @@ case "$COMMAND" in
         ;;
     ingest-all)
         cmd_ingest_all
+        ;;
+    catalog-import)
+        cmd_catalog_import "$@"
         ;;
     help|"")
         cmd_help
