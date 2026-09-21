@@ -75,12 +75,49 @@ def test_symlinks_not_followed_and_rejected(tmp_path):
     reasons = [inv["reason"] for inv in invalid]
     assert "SYMLINK_REJECTED" in reasons
 
-# 3. Derivación correcta de enlace_id
+# 3, 10. Derivación correcta de enlace_id y preservación estricta
 def test_derive_enlace_id_valid():
-    assert derive_enlace_id("PREDI-VICTO89.mp4") == "PREDI-VICTO89"
-    assert derive_enlace_id("/path/to/PREDI-BAYLE539.mov") == "PREDI-BAYLE539"
+    # 1. PREDI-BAYLE539.mp4 -> exacto PREDI-BAYLE539
+    assert derive_enlace_id("PREDI-BAYLE539.mp4") == "PREDI-BAYLE539"
+    # 2. PREDI_VICTO89.mov -> exacto PREDI_VICTO89
+    assert derive_enlace_id("PREDI_VICTO89.mov") == "PREDI_VICTO89"
+    # 3. predi-abc123.mp4 -> preservar minúsculas
+    assert derive_enlace_id("predi-abc123.mp4") == "predi-abc123"
+    assert derive_enlace_id("ABC123.mp4") == "ABC123"
     assert derive_enlace_id("sub/dir/TEST_123-abc.mkv") == "TEST_123-abc"
     assert derive_enlace_id("VIDEO_UPPER.MP4") == "VIDEO_UPPER"
+
+    # 10. derive_enlace_id(valid_file) == Path(valid_file).stem
+    valid_files = [
+        "PREDI-BAYLE539.mp4",
+        "PREDI_VICTO89.mov",
+        "predi-abc123.mp4",
+        "ABC123.mp4",
+        "sub/dir/TEST_123-abc.mkv",
+        "VIDEO_UPPER.MP4"
+    ]
+    for vf in valid_files:
+        assert derive_enlace_id(vf) == Path(vf).stem
+
+# 4, 5, 6, 7, 8, 9. Nombres inválidos rechazados estrictamente (sin normalización ni transformaciones)
+def test_derive_enlace_id_strict_invalid():
+    # 4. PREDI VICTO 89.mp4 -> INVALID (espacio)
+    assert derive_enlace_id("PREDI VICTO 89.mp4") is None
+    # 5. PREDI.VICTO89.mp4 -> INVALID (punto)
+    assert derive_enlace_id("PREDI.VICTO89.mp4") is None
+    # 6. PREDI@VICTO89.mp4 -> INVALID (@)
+    assert derive_enlace_id("PREDI@VICTO89.mp4") is None
+    # 7. Filename con leading o trailing whitespace -> INVALID (sin trim silencioso)
+    assert derive_enlace_id(" PREDI-VICTO89.mp4") is None
+    assert derive_enlace_id("PREDI-VICTO89 .mp4") is None
+    assert derive_enlace_id(" PREDI-VICTO89 .mp4") is None
+    # 8. Nombre > 128 caracteres -> INVALID
+    assert derive_enlace_id("A" * 129 + ".mp4") is None
+    assert derive_enlace_id("A" * 128 + ".mp4") == "A" * 128
+    # 9. Nombre vacío o no derivable -> INVALID
+    assert derive_enlace_id(".mp4") is None
+    assert derive_enlace_id("") is None
+    assert derive_enlace_id(".hidden_video.mp4") is None
 
 # 4. Archivo inválido -> skipped
 def test_invalid_files_skipped(tmp_path):
@@ -92,8 +129,56 @@ def test_invalid_files_skipped(tmp_path):
     candidates, invalid, conflicts = scan_catalog_files(tmp_path)
     assert len(candidates) == 0
     reasons = {inv["reason"] for inv in invalid}
-    assert "SKIPPED_UNSUPPORTED_EXTENSION" in reasons
-    assert "SKIPPED_INVALID_ENLACE_ID" in reasons
+    results = {inv.get("result") for inv in invalid}
+    assert "SKIPPED_UNSUPPORTED_EXTENSION" in results
+    assert "SKIPPED_INVALID_ENLACE_ID" in results
+
+# 11, 12, 13, 14, 15. Archivos inválidos: sin Asset, sin Jobs, sin Redis, sin FFmpeg, reporte detallado
+def test_invalid_files_rejected_without_side_effects(tmp_path, test_db):
+    (tmp_path / "PREDI-VALID001.mp4").write_bytes(b"dummy")
+    (tmp_path / "PREDI INVALID002.mp4").write_bytes(b"dummy")
+    (tmp_path / "PREDI.INVALID003.mp4").write_bytes(b"dummy")
+    (tmp_path / "PREDI@INVALID004.mp4").write_bytes(b"dummy")
+
+    # 11. Dry-run con nombres inválidos no modifica la DB
+    res_dry = import_catalog_cold_assets(root_dir=tmp_path, dry_run=True, db=test_db)
+    assert res_dry.dry_run is True
+    assert res_dry.created == 1
+    assert res_dry.invalid == 3
+    assert test_db.query(Asset).count() == 0
+
+    # Live run: verify no side effects on Redis, FFmpeg, or DB for invalid items
+    with patch("subprocess.Popen") as mock_popen, \
+         patch("redis.Redis.from_url") as mock_redis:
+
+        res = import_catalog_cold_assets(root_dir=tmp_path, dry_run=False, db=test_db)
+        assert res.created == 1
+        assert res.invalid == 3
+
+        # 12. Archivos inválidos no crean Asset (solo se creó el válido)
+        valid_asset = test_db.query(Asset).filter(Asset.enlace_id == "PREDI-VALID001").first()
+        assert valid_asset is not None
+        assert test_db.query(Asset).count() == 1
+        assert test_db.query(Asset).filter(Asset.enlace_id.like("%INVALID%")).first() is None
+
+        # 13. No crean Job
+        assert test_db.query(Job).count() == 0
+
+        # 14. No tocan Redis
+        mock_redis.assert_not_called()
+
+        # 15. No lanzan FFmpeg
+        mock_popen.assert_not_called()
+
+        # Verifica formato de reporte para inválidos (Section 6)
+        invalid_details = res.invalid_details
+        assert len(invalid_details) == 3
+        for inv in invalid_details:
+            assert inv["result"] == "SKIPPED_INVALID_ENLACE_ID"
+            assert "source_uri" in inv
+            assert "filename_stem" in inv
+            assert "reason" in inv
+            assert "suggested_enlace_id" not in inv
 
 # 5, 6, 7, 8, 9. Asset nuevo -> COLD, con URL canónica, sin Jobs, sin Redis, sin FFmpeg
 def test_new_asset_registered_as_cold_without_jobs_or_transcode(tmp_path, test_db):

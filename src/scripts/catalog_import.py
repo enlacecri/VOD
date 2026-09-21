@@ -84,7 +84,10 @@ def main():
     if res.invalid_details:
         print(f"\n[INFO] Invalid/Skipped items ({len(res.invalid_details)}):")
         for inv in res.invalid_details[:5]:
-            print(f"  - {inv.get('path')}: {inv.get('reason')} - {inv.get('detail')}")
+            path_display = inv.get('source_uri', inv.get('path', 'unknown'))
+            stem_display = f" (stem: '{inv.get('filename_stem')}')" if inv.get('filename_stem') else ""
+            reason_display = inv.get('reason', inv.get('detail', ''))
+            print(f"  - {path_display}{stem_display}: {reason_display}")
         if len(res.invalid_details) > 5:
             print(f"  ... and {len(res.invalid_details) - 5} more (see report file)")
 
