@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     HEARTBEAT_INTERVAL_SECONDS: int = 5
     PROGRESS_PERSIST_INTERVAL_SECONDS: int = 5
 
+    # Phase 4 Settings (Dynamic TOP N and Batch Prewarming)
+    VOD_PREWARM_TOP_N: int = 3000
+    VOD_PREWARM_ENQUEUE_LIMIT: int = 50
+    VOD_BATCH_MAX_QUEUE_DEPTH: int = 50
+
     @property
     def normalized_cdn_url(self) -> str:
         return self.CDN_BASE_URL.rstrip("/")

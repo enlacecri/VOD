@@ -1,0 +1,52 @@
+[
+  {
+    "enlace_id": "PREDI-TOP001",
+    "rank": 1,
+    "score": 1000.0
+  },
+  {
+    "enlace_id": "PREDI-TOP002",
+    "rank": 2,
+    "score": 950.0
+  },
+  {
+    "enlace_id": "PREDI-TOP003",
+    "rank": 3,
+    "score": 900.0
+  },
+  {
+    "enlace_id": "PREDI-TOP004",
+    "rank": 4,
+    "score": 850.0
+  },
+  {
+    "enlace_id": "PREDI-TOP005",
+    "rank": 5,
+    "score": 800.0
+  },
+  {
+    "enlace_id": "PREDI-TOP006",
+    "rank": 6,
+    "score": 750.0
+  },
+  {
+    "enlace_id": "PREDI-TOP007",
+    "rank": 7,
+    "score": 700.0
+  },
+  {
+    "enlace_id": "PREDI-TOP008",
+    "rank": 8,
+    "score": 650.0
+  },
+  {
+    "enlace_id": "PREDI-TOP009",
+    "rank": 9,
+    "score": 600.0
+  },
+  {
+    "enlace_id": "PREDI-TOP010",
+    "rank": 10,
+    "score": 550.0
+  }
+]

@@ -633,3 +633,44 @@ except KeyboardInterrupt:
     
     args = (tmp / "worker_args.txt").read_text()
     assert "run_worker.py" in args
+
+
+def test_vod_sh_help_includes_prewarm_commands(env_root):
+    run_vod, tmp, bin_dir, inject_live, start_fake, mk = env_root
+    code, out = run_vod("help")
+    assert code == 0
+    assert "prewarm-plan" in out
+    assert "prewarm-run" in out
+
+
+def test_vod_sh_prewarm_plan_and_run_dispatch(env_root):
+    run_vod, tmp, bin_dir, inject_live, start_fake, mk = env_root
+
+    # Create dummy ranking file
+    ranking_file = tmp / "ranking.json"
+    ranking_file.write_text('[{"enlace_id": "PREDI-T1", "rank": 1}]')
+
+    # Mock python to verify src.scripts.prewarm_cli is called with correct arguments
+    venv_bin = tmp / ".venv" / "bin"
+    python_mock = """#!/bin/bash
+echo "CALLED_WITH: $@"
+exit 0
+"""
+    for name in ("python", "python3"):
+        p = venv_bin / name
+        p.write_text(python_mock)
+        p.chmod(0o755)
+
+    code, out = run_vod("prewarm-plan", "--ranking-file", str(ranking_file), "--top", "10", "--limit", "2")
+    assert code == 0
+    assert "src.scripts.prewarm_cli plan" in out
+    assert "--top 10" in out
+    assert "--limit 2" in out
+
+    code, out = run_vod("prewarm-run", "--ranking-file", str(ranking_file), "--top", "10", "--limit", "2", "--dry-run")
+    assert code == 0
+    assert "src.scripts.prewarm_cli run" in out
+    assert "--top 10" in out
+    assert "--limit 2" in out
+    assert "--dry-run" in out
+
