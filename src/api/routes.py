@@ -11,6 +11,7 @@ from src.core.admin_auth import require_admin_api_key
 from src.core.canonical import build_canonical_manifest_path, build_canonical_manifest_url, get_canonical_output_dir
 from src.models.asset import Asset
 from src.schemas.asset import AssetCreate, AssetResponse, ColdAssetCreate, PreparePlaybackResponse
+from src.core.queues import QUEUE_BATCH, QUEUE_PRIORITY
 
 router = APIRouter()
 
@@ -365,8 +366,13 @@ def prepare_playback(vod_uuid: uuid.UUID, db: Session = Depends(get_db)):
         active_job = db.query(Job).filter(
             Job.asset_id == asset.id,
             Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING])
-        ).first()
+        ).with_for_update().first()
         if active_job:
+            # Promoción obligatoria si está pendiente en vod_batch
+            if active_job.queue_name == QUEUE_BATCH and active_job.status == JobStatus.PENDING:
+                from src.services.job_dispatch import promote_batch_to_priority
+                promote_batch_to_priority(active_job, asset, db)
+
             return PreparePlaybackResponse(
                 vod_uuid=asset.vod_uuid,
                 enlace_id=asset.enlace_id,
@@ -379,55 +385,17 @@ def prepare_playback(vod_uuid: uuid.UUID, db: Session = Depends(get_db)):
                 error_message=None
             )
 
-    # 5. Asset is in COLD, CREATED, or FAILED: transition to QUEUED and enqueue progressive job
-    if not asset.manifest_url or not asset.manifest_path:
-        asset.manifest_url = build_canonical_manifest_url(asset.vod_uuid, asset.enlace_id)
-        asset.manifest_path = build_canonical_manifest_path(asset.vod_uuid, asset.enlace_id)
-
-    asset.status = VideoStatus.QUEUED
-    asset.error_code = None
-    asset.error_message = None
-
-    new_job = Job(
-        asset_id=asset.id,
-        type=JobType.TRANSCODE,
-        status=JobStatus.PENDING,
-        attempt=1,
-        max_attempts=settings.MAX_TRANSCODE_ATTEMPTS
-    )
-    db.add(new_job)
-    db.add(AssetEvent(
-        asset_id=asset.id,
-        event_type=EventType.TRANSITION,
-        details={"new_status": "QUEUED", "job_id": str(new_job.id), "context": "prepare-playback"}
-    ))
-    db.commit()
-    db.refresh(new_job)
-
+    # 5. Asset is in COLD, CREATED, or FAILED: transition to QUEUED and dispatch to vod_priority
+    from src.services.job_dispatch import dispatch_progressive_job, QueueUnavailableError
+    from src.core.queues import QUEUE_PRIORITY
     try:
-        redis_conn = Redis.from_url(settings.REDIS_URL)
-        q = Queue(name=settings.RQ_QUEUE_NAME, connection=redis_conn)
-        existing_rq_job = q.fetch_job(str(new_job.id))
-        if existing_rq_job:
-            rq_job = existing_rq_job
-        else:
-            rq_job = q.enqueue(
-                "src.worker.tasks.progressive_transcode_asset_job", 
-                args=(new_job.id,),
-                job_id=str(new_job.id),
-                job_timeout=settings.FFMPEG_TIMEOUT_SECONDS + 300,
-                result_ttl=86400
-            )
-        new_job.rq_job_id = rq_job.id
-        db.commit()
-    except Exception as e:
-        asset.status = VideoStatus.FAILED
-        asset.error_code = "E_QUEUE_UNAVAILABLE"
-        asset.error_message = f"Could not enqueue progressive job: {e}"
-        new_job.status = JobStatus.FAILED
-        new_job.error_code = "E_QUEUE_UNAVAILABLE"
-        new_job.error_message = str(e)
-        db.commit()
+        dispatch_progressive_job(
+            asset=asset,
+            queue_name=QUEUE_PRIORITY,
+            db=db,
+            context="prepare-playback"
+        )
+    except QueueUnavailableError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"error_code": "E_QUEUE_UNAVAILABLE", "message": "Failed to enqueue job"}

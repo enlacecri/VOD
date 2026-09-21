@@ -15,6 +15,7 @@ class Job(Base):
     
     type = Column(Enum(JobType), nullable=False)
     status = Column(Enum(JobStatus), default=JobStatus.PENDING, nullable=False)
+    queue_name = Column(String(64), nullable=False, default="vod_tasks", server_default="vod_tasks")
     
     rq_job_id = Column(String, nullable=True, index=True)
     worker_id = Column(String, nullable=True)

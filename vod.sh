@@ -19,8 +19,13 @@ RUN_DIR="storage/run"
 LOGS_DIR="storage/logs/services"
 API_PID_FILE="$RUN_DIR/api.pid"
 WORKER_PID_FILE="$RUN_DIR/worker.pid"
+WORKER_PRIORITY_PID_FILE="$RUN_DIR/worker_priority.pid"
+WORKER_BATCH_PID_FILE="$RUN_DIR/worker_batch.pid"
+
 API_LOG_FILE="$LOGS_DIR/api.log"
 WORKER_LOG_FILE="$LOGS_DIR/worker.log"
+WORKER_PRIORITY_LOG_FILE="$LOGS_DIR/worker_priority.log"
+WORKER_BATCH_LOG_FILE="$LOGS_DIR/worker_batch.log"
 
 ALLOWED_EXTENSIONS=(".mp4" ".mov" ".mkv" ".mxf" ".avi" ".m4v")
 
@@ -200,13 +205,33 @@ cmd_start() {
         success "API iniciada (PID: $(cat $API_PID_FILE))"
     fi
     if check_pid_running "$WORKER_PID_FILE" "run_worker"; then
-        warning "El worker ya estaba iniciado (PID: $(cat $WORKER_PID_FILE))."
+        warning "El Legacy Worker ya estaba iniciado (PID: $(cat $WORKER_PID_FILE))."
     else
-        echo -n "Iniciando Worker... "
-        "$VENV_PYTHON" src/scripts/run_worker.py > "$WORKER_LOG_FILE" 2>&1 &
+        echo -n "Iniciando Legacy Worker (vod_tasks)... "
+        "$VENV_PYTHON" src/scripts/run_worker.py --queue vod_tasks --name vod-legacy-worker > "$WORKER_LOG_FILE" 2>&1 &
         echo $! > "$WORKER_PID_FILE"
         worker_started_this_run=1
-        success "Worker iniciado (PID: $(cat $WORKER_PID_FILE))"
+        success "Legacy Worker iniciado (PID: $(cat $WORKER_PID_FILE))"
+    fi
+
+    if check_pid_running "$WORKER_PRIORITY_PID_FILE" "run_worker"; then
+        warning "El Priority Worker ya estaba iniciado (PID: $(cat $WORKER_PRIORITY_PID_FILE))."
+    else
+        echo -n "Iniciando Priority Worker (vod_priority)... "
+        "$VENV_PYTHON" src/scripts/run_worker.py --queue vod_priority --name vod-priority-worker > "$WORKER_PRIORITY_LOG_FILE" 2>&1 &
+        echo $! > "$WORKER_PRIORITY_PID_FILE"
+        worker_priority_started_this_run=1
+        success "Priority Worker iniciado (PID: $(cat $WORKER_PRIORITY_PID_FILE))"
+    fi
+
+    if check_pid_running "$WORKER_BATCH_PID_FILE" "run_worker"; then
+        warning "El Batch Worker ya estaba iniciado (PID: $(cat $WORKER_BATCH_PID_FILE))."
+    else
+        echo -n "Iniciando Batch Worker (vod_batch)... "
+        "$VENV_PYTHON" src/scripts/run_worker.py --queue vod_batch --name vod-batch-worker > "$WORKER_BATCH_LOG_FILE" 2>&1 &
+        echo $! > "$WORKER_BATCH_PID_FILE"
+        worker_batch_started_this_run=1
+        success "Batch Worker iniciado (PID: $(cat $WORKER_BATCH_PID_FILE))"
     fi
 
     # Check API health
@@ -250,6 +275,12 @@ EOF
         if [ "$worker_started_this_run" -eq 1 ]; then
             graceful_kill "$WORKER_PID_FILE" "run_worker"
         fi
+        if [ "$worker_priority_started_this_run" -eq 1 ]; then
+            graceful_kill "$WORKER_PRIORITY_PID_FILE" "run_worker"
+        fi
+        if [ "$worker_batch_started_this_run" -eq 1 ]; then
+            graceful_kill "$WORKER_BATCH_PID_FILE" "run_worker"
+        fi
         exit 1
     fi
 
@@ -266,19 +297,21 @@ queue_name = settings.RQ_QUEUE_NAME
 
 for _ in range(15):
     workers = Worker.all(connection=redis_conn)
+    qnames = set()
     for w in workers:
-        if queue_name in w.queue_names():
-            print(queue_name)
-            sys.exit(0)
+        qnames.update(w.queue_names())
+    if queue_name in qnames:
+        print(", ".join(sorted(qnames)))
+        sys.exit(0)
     time.sleep(1)
 sys.exit(1)
 EOF
 )
     local worker_queue
     if worker_queue=$("$VENV_PYTHON" -c "$worker_health_script" 2>/dev/null); then
-        success "Worker escuchando en la cola: $worker_queue"
+        success "Workers escuchando en las colas: $worker_queue"
     else
-        error "Healthcheck del Worker falló. No se detectó worker escuchando en la cola correcta."
+        error "Healthcheck del Worker falló. No se detectaron workers escuchando en las colas esperadas."
         
         # Rollback de lo que iniciamos
         info "Iniciando Rollback de procesos..."
@@ -287,6 +320,12 @@ EOF
         fi
         if [ "$worker_started_this_run" -eq 1 ]; then
             graceful_kill "$WORKER_PID_FILE" "run_worker"
+        fi
+        if [ "$worker_priority_started_this_run" -eq 1 ]; then
+            graceful_kill "$WORKER_PRIORITY_PID_FILE" "run_worker"
+        fi
+        if [ "$worker_batch_started_this_run" -eq 1 ]; then
+            graceful_kill "$WORKER_BATCH_PID_FILE" "run_worker"
         fi
         exit 1
     fi
@@ -304,6 +343,8 @@ EOF
 
 cmd_stop() {
     info "Deteniendo servicios VOD..."
+    graceful_kill "$WORKER_BATCH_PID_FILE" "run_worker"
+    graceful_kill "$WORKER_PRIORITY_PID_FILE" "run_worker"
     graceful_kill "$WORKER_PID_FILE" "run_worker"
     graceful_kill "$API_PID_FILE" "uvicorn"
     
@@ -328,15 +369,27 @@ cmd_status() {
 
     echo -e "\n${CYAN}--- ESTADO DE PROCESOS ---${NC}"
     if check_pid_running "$API_PID_FILE" "uvicorn"; then
-        echo -e "API:    ${GREEN}Corriendo${NC} (PID: $(cat $API_PID_FILE))"
+        echo -e "API:             ${GREEN}Corriendo${NC} (PID: $(cat $API_PID_FILE))"
     else
-        echo -e "API:    ${RED}Detenida${NC}"
+        echo -e "API:             ${RED}Detenida${NC}"
     fi
 
     if check_pid_running "$WORKER_PID_FILE" "run_worker"; then
-        echo -e "Worker: ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_PID_FILE))"
+        echo -e "Legacy Worker:   ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_PID_FILE), Queue: vod_tasks)"
     else
-        echo -e "Worker: ${RED}Detenida${NC}"
+        echo -e "Legacy Worker:   ${RED}Detenido${NC}"
+    fi
+
+    if check_pid_running "$WORKER_PRIORITY_PID_FILE" "run_worker"; then
+        echo -e "Priority Worker: ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_PRIORITY_PID_FILE), Queue: vod_priority)"
+    else
+        echo -e "Priority Worker: ${RED}Detenido${NC}"
+    fi
+
+    if check_pid_running "$WORKER_BATCH_PID_FILE" "run_worker"; then
+        echo -e "Batch Worker:    ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_BATCH_PID_FILE), Queue: vod_batch)"
+    else
+        echo -e "Batch Worker:    ${RED}Detenido${NC}"
     fi
 
     echo -e "\n${CYAN}--- HEALTHCHECKS ---${NC}"
@@ -363,11 +416,14 @@ from redis import Redis
 from rq import Queue
 try:
     from src.core.config import settings
+    from src.core.queues import ALL_QUEUES
     redis_conn = Redis.from_url(settings.REDIS_URL)
-    q = Queue(name=settings.RQ_QUEUE_NAME, connection=redis_conn)
-    print(f"Queued:  {q.count}")
-    print(f"Started: {q.started_job_registry.count}")
-    print(f"Failed:  {q.failed_job_registry.count}")
+    for qname in ALL_QUEUES:
+        q = Queue(name=qname, connection=redis_conn)
+        queued = q.count
+        started = q.started_job_registry.count
+        failed = q.failed_job_registry.count
+        print(f"[{qname}] Queued: {queued} | Started: {started} | Failed: {failed}")
 except Exception as e:
     print(f"Error consultando Redis/RQ: {e}")
 EOF
@@ -621,14 +677,19 @@ cmd_catalog_import() {
     "$VENV_PYTHON" -m src.scripts.catalog_import "$@"
 }
 
+cmd_batch_enqueue() {
+    check_deps
+    "$VENV_PYTHON" -m src.scripts.batch_enqueue "$@"
+}
+
 cmd_help() {
     echo -e "${CYAN}VOD MVP Management Script${NC}"
     echo "========================="
     echo "Uso: ./vod.sh <comando> [argumentos]"
     echo ""
     echo "Comandos:"
-    echo "  start           Inicializa bases de datos, migraciones, API y Worker."
-    echo "  stop            Detiene la API, el Worker y la base de datos de manera segura."
+    echo "  start           Inicializa bases de datos, migraciones, API y Workers."
+    echo "  stop            Detiene la API, los Workers y la base de datos de manera segura."
     echo "  restart         Ejecuta stop y luego start."
     echo "  status          Muestra el estado de contenedores, procesos, colas y salud."
     echo "  logs            Muestra las últimas 50 líneas de los logs operativos."
@@ -638,6 +699,8 @@ cmd_help() {
     echo "  ingest-all      Escanea y registra todos los archivos válidos en INGEST_ROOT."
     echo "  catalog-import  Registro masivo del catálogo como assets COLD sin transcodificar."
     echo "                  Uso: ./vod.sh catalog-import [--dry-run] [--limit N] [--root PATH]"
+    echo "  batch-enqueue   Encola un asset COLD para procesamiento en segundo plano (vod_batch)."
+    echo "                  Uso: ./vod.sh batch-enqueue <VOD_UUID> [--enlace-id <ENLACE_ID>]"
     echo ""
     echo "Ejemplo completo:"
     echo "  cp /ruta/del/video/PREDI-MVIDA464.mp4 storage/input/"
@@ -679,6 +742,9 @@ case "$COMMAND" in
         ;;
     catalog-import)
         cmd_catalog_import "$@"
+        ;;
+    batch-enqueue)
+        cmd_batch_enqueue "$@"
         ;;
     help|"")
         cmd_help
