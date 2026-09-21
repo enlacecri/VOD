@@ -53,6 +53,7 @@ nginx/certs/*
 storage/run/
 storage/logs/
 *.log
+*.pid
 
 # Temp & Artifacts
 *.tmp
@@ -60,6 +61,7 @@ storage/logs/
 *.orig
 *.rej
 .DS_Store
+.pytest_cache/
 test_out/
 test_out.txt
 tests/sandbox/
