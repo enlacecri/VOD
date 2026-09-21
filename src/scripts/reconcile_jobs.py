@@ -271,7 +271,7 @@ def reconcile_jobs():
                     logger.info(f"Re-enqueueing PENDING job {job.id} to queue '{target_queue}'")
                     task_func = (
                         "src.worker.tasks.progressive_transcode_asset_job"
-                        if target_queue in ("vod_priority", "vod_batch") or job.type == JobType.TRANSCODE
+                        if target_queue in ("vod_priority", "vod_ingest", "vod_batch") or job.type == JobType.TRANSCODE
                         else "src.worker.tasks.probe_and_prepare_job"
                     )
                     timeout = (
@@ -352,3 +352,6 @@ if __name__ == "__main__":
     reconcile_jobs()
     reconcile_staging(dry_run=not args.clean_staging)
     reconcile_published_assets()
+
+    from src.services.workflow.reconciler import reconcile_workflow_steps
+    reconcile_workflow_steps()

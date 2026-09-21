@@ -11,7 +11,7 @@ from src.core.admin_auth import require_admin_api_key
 from src.core.canonical import build_canonical_manifest_path, build_canonical_manifest_url, get_canonical_output_dir
 from src.models.asset import Asset
 from src.schemas.asset import AssetCreate, AssetResponse, ColdAssetCreate, PreparePlaybackResponse
-from src.core.queues import QUEUE_BATCH, QUEUE_PRIORITY
+from src.core.queues import QUEUE_BATCH, QUEUE_PRIORITY, QUEUE_INGEST
 
 router = APIRouter()
 
@@ -368,10 +368,10 @@ def prepare_playback(vod_uuid: uuid.UUID, db: Session = Depends(get_db)):
             Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING])
         ).with_for_update().first()
         if active_job:
-            # Promoción obligatoria si está pendiente en vod_batch
-            if active_job.queue_name == QUEUE_BATCH and active_job.status == JobStatus.PENDING:
-                from src.services.job_dispatch import promote_batch_to_priority
-                promote_batch_to_priority(active_job, asset, db)
+            # Promoción obligatoria si está pendiente en vod_batch o vod_ingest
+            if active_job.queue_name in (QUEUE_BATCH, QUEUE_INGEST) and active_job.status == JobStatus.PENDING:
+                from src.services.job_dispatch import promote_pending_job_to_priority
+                promote_pending_job_to_priority(active_job, asset, db)
 
             return PreparePlaybackResponse(
                 vod_uuid=asset.vod_uuid,

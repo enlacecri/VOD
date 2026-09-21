@@ -48,3 +48,55 @@ E_HLS_VALIDATION_FAILED = "E_HLS_VALIDATION_FAILED"
 E_OUTPUT_EXISTS = "E_OUTPUT_EXISTS"
 E_ATOMIC_PROMOTION_FAILED = "E_ATOMIC_PROMOTION_FAILED"
 
+# Phase 5 Enums
+class IngestStatus(str, enum.Enum):
+    DETECTED = "DETECTED"
+    WAITING_STABLE = "WAITING_STABLE"
+    METADATA_PENDING = "METADATA_PENDING"
+    METADATA_READY = "METADATA_READY"
+    REGISTERED = "REGISTERED"
+    DISPATCHED = "DISPATCHED"
+    CONFLICT = "CONFLICT"
+    SOURCE_CHANGED = "SOURCE_CHANGED"
+    FAILED = "FAILED"
+
+    @classmethod
+    def _missing_(cls, value):
+        if isinstance(value, str):
+            val_upper = value.upper()
+            for member in cls:
+                if member.value == val_upper or member.name == val_upper:
+                    return member
+        return None
+
+class WorkflowStepType(str, enum.Enum):
+    AZURE_BACKUP = "AZURE_BACKUP"
+    SUBTITLES = "SUBTITLES"
+    ENLACE_SYNC = "ENLACE_SYNC"
+
+    @classmethod
+    def _missing_(cls, value):
+        if isinstance(value, str):
+            val_upper = value.upper()
+            for member in cls:
+                if member.value == val_upper or member.name == val_upper:
+                    return member
+        return None
+
+class WorkflowStepStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    QUEUED = "QUEUED"
+    PROCESSING = "PROCESSING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+    @classmethod
+    def _missing_(cls, value):
+        if isinstance(value, str):
+            val_upper = value.upper()
+            for member in cls:
+                if member.value == val_upper or member.name == val_upper:
+                    return member
+        return None
+
+

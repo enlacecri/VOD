@@ -69,8 +69,12 @@ def test_admin_dashboard(mock_redis, mock_queue, mock_workers, admin_key):
     assert q_data["stale_jobs"] == 0
     assert q_data["legacy_queue_depth"] == 3
     assert q_data["priority_queue_depth"] == 3
+    assert q_data["ingest_queue_depth"] == 3
     assert q_data["batch_queue_depth"] == 3
-    assert q_data["total_queue_depth"] == 9
+    assert q_data["backup_queue_depth"] == 3
+    assert q_data["subtitles_queue_depth"] == 3
+    assert q_data["sync_queue_depth"] == 3
+    assert q_data["total_queue_depth"] == 21
 
 def test_admin_assets_expanded_fields_and_playback_url(admin_key, db_session):
     from src.models.asset import Asset
