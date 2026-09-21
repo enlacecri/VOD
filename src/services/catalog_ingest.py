@@ -19,9 +19,9 @@ from src.core.canonical import (
     build_canonical_manifest_url,
 )
 from src.core.security import secure_resolve, SecurityError
+from src.core.enlace_id import validate_enlace_id, ENLACE_ID_REGEX
 from src.models.asset import Asset
 from src.models.enums import VideoStatus
-from src.schemas.asset import ENLACE_ID_REGEX
 
 logger = logging.getLogger(__name__)
 
@@ -40,24 +40,6 @@ IGNORED_DIR_NAMES = {
     "logs",
     "run",
 }
-
-def validate_enlace_id(stem: str) -> tuple[bool, Optional[str]]:
-    """
-    Validates that a filename stem strictly conforms to canonical enlace_id format.
-    No trimming, no replacement, no transformation.
-    Must match ^[A-Za-z0-9_-]{1,128}$ exactly.
-    """
-    if not stem:
-        return False, "enlace_id is empty or non-derivable"
-    if len(stem) > 128:
-        return False, "enlace_id exceeds maximum length of 128 characters"
-    if " " in stem:
-        return False, "enlace_id contains whitespace"
-    if "." in stem:
-        return False, "enlace_id contains dots"
-    if not ENLACE_ID_REGEX.fullmatch(stem):
-        return False, "enlace_id contains unsupported characters"
-    return True, None
 
 def derive_enlace_id(path: Union[str, Path]) -> Optional[str]:
     """

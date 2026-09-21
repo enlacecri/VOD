@@ -101,23 +101,55 @@ def test_derive_enlace_id_valid():
 
 # 4, 5, 6, 7, 8, 9. Nombres inválidos rechazados estrictamente (sin normalización ni transformaciones)
 def test_derive_enlace_id_strict_invalid():
-    # 4. PREDI VICTO 89.mp4 -> INVALID (espacio)
-    assert derive_enlace_id("PREDI VICTO 89.mp4") is None
-    # 5. PREDI.VICTO89.mp4 -> INVALID (punto)
-    assert derive_enlace_id("PREDI.VICTO89.mp4") is None
-    # 6. PREDI@VICTO89.mp4 -> INVALID (@)
-    assert derive_enlace_id("PREDI@VICTO89.mp4") is None
-    # 7. Filename con leading o trailing whitespace -> INVALID (sin trim silencioso)
-    assert derive_enlace_id(" PREDI-VICTO89.mp4") is None
-    assert derive_enlace_id("PREDI-VICTO89 .mp4") is None
-    assert derive_enlace_id(" PREDI-VICTO89 .mp4") is None
-    # 8. Nombre > 128 caracteres -> INVALID
+    from src.core.enlace_id import validate_enlace_id
+
+    # Casos válidos
+    assert derive_enlace_id("PREDI-ABC123.mp4") == "PREDI-ABC123"
+    assert derive_enlace_id("PREDI_ABC123.mp4") == "PREDI_ABC123"
+    assert derive_enlace_id("predi-abc123.mp4") == "predi-abc123"
+
+    # Casos inválidos
+    # PREDI.ABC123 -> INVALID (punto)
+    assert derive_enlace_id("PREDI.ABC123.mp4") is None
+    ok, reason = validate_enlace_id("PREDI.ABC123")
+    assert not ok and reason == "contains_dots"
+
+    # PREDI ABC123 -> INVALID (espacio)
+    assert derive_enlace_id("PREDI ABC123.mp4") is None
+    ok, reason = validate_enlace_id("PREDI ABC123")
+    assert not ok and reason == "whitespace"
+
+    # PREDI@ABC123 -> INVALID (@)
+    assert derive_enlace_id("PREDI@ABC123.mp4") is None
+    ok, reason = validate_enlace_id("PREDI@ABC123")
+    assert not ok and reason == "unsupported_characters"
+
+    # Leading whitespace -> INVALID
+    assert derive_enlace_id(" PREDI-ABC123.mp4") is None
+    ok, reason = validate_enlace_id(" PREDI-ABC123")
+    assert not ok and reason == "whitespace"
+
+    # Trailing whitespace -> INVALID
+    assert derive_enlace_id("PREDI-ABC123 .mp4") is None
+    ok, reason = validate_enlace_id("PREDI-ABC123 ")
+    assert not ok and reason == "whitespace"
+
+    # 129 caracteres -> INVALID
     assert derive_enlace_id("A" * 129 + ".mp4") is None
+    ok, reason = validate_enlace_id("A" * 129)
+    assert not ok and reason == "too_long"
+
+    # 128 caracteres -> VÁLIDO
     assert derive_enlace_id("A" * 128 + ".mp4") == "A" * 128
-    # 9. Nombre vacío o no derivable -> INVALID
+    ok, reason = validate_enlace_id("A" * 128)
+    assert ok and reason is None
+
+    # Nombre vacío o no derivable -> INVALID
     assert derive_enlace_id(".mp4") is None
     assert derive_enlace_id("") is None
     assert derive_enlace_id(".hidden_video.mp4") is None
+    ok, reason = validate_enlace_id("")
+    assert not ok and reason == "empty"
 
 # 4. Archivo inválido -> skipped
 def test_invalid_files_skipped(tmp_path):

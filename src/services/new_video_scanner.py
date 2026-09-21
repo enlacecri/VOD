@@ -14,6 +14,7 @@ from redis import Redis
 from src.core.config import settings
 from src.core.queues import QUEUE_INGEST, get_redis_connection
 from src.core.canonical import build_canonical_manifest_path, build_canonical_manifest_url
+from src.core.enlace_id import validate_enlace_id
 from src.models.asset import Asset
 from src.models.ingest_item import IngestItem
 from src.models.enums import VideoStatus, IngestStatus
@@ -24,7 +25,6 @@ from src.services.job_dispatch import dispatch_progressive_job
 logger = logging.getLogger(__name__)
 
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".mxf", ".avi", ".m4v"}
-STRICT_ENLACE_ID_REGEX = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
 
 def compute_source_fingerprint(relative_path: str, size_bytes: int, mtime: float) -> str:
     content = f"{relative_path}:{size_bytes}:{mtime:.4f}"
@@ -238,13 +238,14 @@ def scan_new_videos(
                         db.commit()
                     continue
 
-                # Metadata available! Validate strict enlace_id
-                enlace_id = metadata.enlace_id.strip() if metadata.enlace_id else ""
-                if not enlace_id or not STRICT_ENLACE_ID_REGEX.match(enlace_id):
+                # Metadata available! Validate strict enlace_id without any trim/normalization
+                enlace_id = metadata.enlace_id
+                is_valid_id, id_reason = validate_enlace_id(enlace_id)
+                if not is_valid_id:
                     result.failed += 1
                     if not dry_run:
                         existing_item.status = IngestStatus.FAILED
-                        existing_item.last_error = f"Invalid enlace_id format: '{enlace_id}'"
+                        existing_item.last_error = f"Invalid enlace_id format: '{enlace_id}' ({id_reason})"
                         db.commit()
                     continue
 
