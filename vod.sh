@@ -682,6 +682,16 @@ cmd_batch_enqueue() {
     "$VENV_PYTHON" -m src.scripts.batch_enqueue "$@"
 }
 
+cmd_prewarm_plan() {
+    check_deps
+    "$VENV_PYTHON" -m src.scripts.prewarm_cli plan "$@"
+}
+
+cmd_prewarm_run() {
+    check_deps
+    "$VENV_PYTHON" -m src.scripts.prewarm_cli run "$@"
+}
+
 cmd_help() {
     echo -e "${CYAN}VOD MVP Management Script${NC}"
     echo "========================="
@@ -701,6 +711,10 @@ cmd_help() {
     echo "                  Uso: ./vod.sh catalog-import [--dry-run] [--limit N] [--root PATH]"
     echo "  batch-enqueue   Encola un asset COLD para procesamiento en segundo plano (vod_batch)."
     echo "                  Uso: ./vod.sh batch-enqueue <VOD_UUID> [--enlace-id <ENLACE_ID>]"
+    echo "  prewarm-plan    Calcula el plan de prewarming en modo 100% dry-run."
+    echo "                  Uso: ./vod.sh prewarm-plan --ranking-file <FILE> [--top N] [--limit N]"
+    echo "  prewarm-run     Ejecuta el prewarming enviando candidatos COLD a vod_batch."
+    echo "                  Uso: ./vod.sh prewarm-run --ranking-file <FILE> [--top N] [--limit N] [--dry-run]"
     echo ""
     echo "Ejemplo completo:"
     echo "  cp /ruta/del/video/PREDI-MVIDA464.mp4 storage/input/"
@@ -745,6 +759,12 @@ case "$COMMAND" in
         ;;
     batch-enqueue)
         cmd_batch_enqueue "$@"
+        ;;
+    prewarm-plan)
+        cmd_prewarm_plan "$@"
+        ;;
+    prewarm-run)
+        cmd_prewarm_run "$@"
         ;;
     help|"")
         cmd_help
