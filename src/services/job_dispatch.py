@@ -58,6 +58,11 @@ def dispatch_progressive_job(
     if queue_name not in (QUEUE_PRIORITY, QUEUE_BATCH, QUEUE_LEGACY):
         raise ValueError(f"Invalid queue name: {queue_name}")
 
+    if asset.status == VideoStatus.FAILED:
+        raise DispatchError(
+            f"Asset {asset.vod_uuid} is in FAILED state. Requires explicit operator retry."
+        )
+
     if not asset.manifest_url or not asset.manifest_path:
         asset.manifest_url = build_canonical_manifest_url(asset.vod_uuid, asset.enlace_id)
         asset.manifest_path = build_canonical_manifest_path(asset.vod_uuid, asset.enlace_id)
@@ -107,15 +112,14 @@ def dispatch_progressive_job(
         db.commit()
         return new_job
     except Exception as e:
-        logger.error(f"Failed to enqueue progressive job {new_job.id} to {queue_name}: {e}")
-        asset.status = VideoStatus.FAILED
-        asset.error_code = "E_QUEUE_UNAVAILABLE"
-        asset.error_message = f"Could not enqueue progressive job to {queue_name}: {e}"
-        new_job.status = JobStatus.FAILED
-        new_job.error_code = "E_QUEUE_UNAVAILABLE"
-        new_job.error_message = str(e)
-        db.commit()
-        raise QueueUnavailableError(f"Failed to enqueue job: {e}")
+        logger.warning(
+            f"Redis unavailable while enqueuing job {new_job.id} to {queue_name}: {e}. "
+            f"Job remains PENDING in PostgreSQL for reconciler recovery."
+        )
+        if not new_job.rq_job_id:
+            new_job.rq_job_id = str(new_job.id)
+            db.commit()
+        raise QueueUnavailableError(f"Failed to enqueue job to Redis: {e}")
 
 def promote_batch_to_priority(
     active_job: Job,
@@ -160,12 +164,30 @@ def promote_batch_to_priority(
     try:
         rq_job = RQJob.fetch(target_rq_id, connection=conn)
     except NoSuchJobError:
-        logger.warning(f"Promotion: RQ job {target_rq_id} not found in Redis. Re-enqueueing to {QUEUE_PRIORITY}.")
+        # Check if the job might already be running in StartedJobRegistry of any queue
+        q_batch = get_queue(QUEUE_BATCH, connection=conn)
+        q_prio = get_queue(QUEUE_PRIORITY, connection=conn)
+        in_started = (
+            target_rq_id in q_batch.started_job_registry.get_job_ids() or
+            target_rq_id in q_prio.started_job_registry.get_job_ids() or
+            str(active_job.id) in q_batch.started_job_registry.get_job_ids() or
+            str(active_job.id) in q_prio.started_job_registry.get_job_ids()
+        )
+        if in_started:
+            logger.info(f"Promotion: Job {active_job.id} found in started registry. Reusing ongoing execution.")
+            active_job.status = JobStatus.PROCESSING
+            db.commit()
+            return {
+                "action": "REUSE_STARTED",
+                "job": active_job,
+                "detail": "Worker already started execution, reusing ongoing transcode."
+            }
+
+        logger.warning(f"Promotion: RQ job {target_rq_id} not found in Redis. Safely re-enqueueing to {QUEUE_PRIORITY}.")
         # Re-enqueue in priority queue
         active_job.queue_name = QUEUE_PRIORITY
         db.commit()
         try:
-            q_prio = get_queue(QUEUE_PRIORITY, connection=conn)
             new_rq = q_prio.enqueue(
                 "src.worker.tasks.progressive_transcode_asset_job",
                 args=(active_job.id,),
@@ -178,7 +200,7 @@ def promote_batch_to_priority(
             return {
                 "action": "PROMOTED_RECREATED",
                 "job": active_job,
-                "detail": "Missing RQ job recreated directly in vod_priority."
+                "detail": "Missing RQ job recreated safely in vod_priority."
             }
         except Exception as e:
             logger.error(f"Failed to re-enqueue missing job to priority: {e}")
@@ -345,23 +367,37 @@ def batch_enqueue_asset(
         }
 
     if asset.status == VideoStatus.COLD or asset.status == VideoStatus.CREATED:
-        job = dispatch_progressive_job(
-            asset=asset,
-            queue_name=QUEUE_BATCH,
-            db=db,
-            context="batch-enqueue",
-            redis_conn=redis_conn
-        )
-        return {
-            "status": "ENQUEUED_BATCH",
-            "vod_uuid": str(asset.vod_uuid),
-            "enlace_id": asset.enlace_id,
-            "asset_status": asset.status.value,
-            "job_id": str(job.id),
-            "rq_job_id": job.rq_job_id,
-            "queue_name": QUEUE_BATCH,
-            "detail": "Asset successfully enqueued to vod_batch."
-        }
+        try:
+            job = dispatch_progressive_job(
+                asset=asset,
+                queue_name=QUEUE_BATCH,
+                db=db,
+                context="batch-enqueue",
+                redis_conn=redis_conn
+            )
+            return {
+                "status": "ENQUEUED_BATCH",
+                "vod_uuid": str(asset.vod_uuid),
+                "enlace_id": asset.enlace_id,
+                "asset_status": asset.status.value,
+                "job_id": str(job.id),
+                "rq_job_id": job.rq_job_id,
+                "queue_name": QUEUE_BATCH,
+                "detail": "Asset successfully enqueued to vod_batch."
+            }
+        except QueueUnavailableError as e:
+            # Job was committed in PostgreSQL as PENDING and will be enqueued by reconciler
+            job = db.query(Job).filter(Job.asset_id == asset.id).order_by(Job.created_at.desc()).first()
+            return {
+                "status": "ENQUEUED_BATCH_REDIS_OFFLINE",
+                "vod_uuid": str(asset.vod_uuid),
+                "enlace_id": asset.enlace_id,
+                "asset_status": asset.status.value,
+                "job_id": str(job.id) if job else None,
+                "rq_job_id": job.rq_job_id if job else None,
+                "queue_name": QUEUE_BATCH,
+                "detail": "Job persisted as PENDING in PostgreSQL, but Redis was unavailable. Reconciler will enqueue."
+            }
 
     return {
         "status": f"UNSUPPORTED_STATUS_{asset.status.value}",

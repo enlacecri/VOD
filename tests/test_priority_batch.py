@@ -470,3 +470,206 @@ def test_promotion_redis_failure_recovery(test_db, redis_conn):
     job_after = test_db.query(Job).filter(Job.id == job.id).first()
     assert job_after is not None
     # Reconciler can re-enqueue it later into the queue specified by queue_name
+
+# 24, 25, 26. FAILED no puede reintentarse desde prepare-playback: 0 jobs, 0 redis, 0 ffmpeg
+def test_failed_asset_prepare_playback_rejected(test_db, redis_conn):
+    vod_uuid = uuid.uuid4()
+    asset = Asset(
+        vod_uuid=vod_uuid,
+        enlace_id="PREDI-HARDEN-FAIL",
+        source_uri="fail.mp4",
+        status=VideoStatus.FAILED,
+        error_code="E_PREV_FAILURE",
+        error_message="Previous transcode failed completely"
+    )
+    test_db.add(asset)
+    test_db.commit()
+
+    # Call prepare-playback on FAILED asset
+    resp = client.post(f"/api/v1/assets/{vod_uuid}/prepare-playback")
+    assert resp.status_code == 409
+    data = resp.json()["detail"]
+    assert data["error_code"] == "REQUIRES_EXPLICIT_RETRY"
+    assert data["status"] == "FAILED"
+
+    # Asset must remain strictly in FAILED status
+    test_db.expire_all()
+    asset_after = test_db.query(Asset).filter(Asset.vod_uuid == vod_uuid).first()
+    assert asset_after.status == VideoStatus.FAILED
+
+    # No jobs created in DB
+    jobs = test_db.query(Job).filter(Job.asset_id == asset.id).all()
+    assert len(jobs) == 0
+
+    # No jobs in Redis across ALL queues
+    q_prio = get_queue(QUEUE_PRIORITY, redis_conn)
+    q_batch = get_queue(QUEUE_BATCH, redis_conn)
+    q_legacy = get_queue(QUEUE_LEGACY, redis_conn)
+    assert q_prio.count == 0
+    assert q_batch.count == 0
+    assert q_legacy.count == 0
+
+# 27, 28. Fallo Redis en dispatch inicial priority queda recuperable y reconciler recupera en priority
+def test_dispatch_priority_redis_failure_recovery(test_db, redis_conn):
+    vod_uuid = uuid.uuid4()
+    asset = Asset(
+        vod_uuid=vod_uuid,
+        enlace_id="PREDI-REDIS-PRIO",
+        source_uri="prio.mp4",
+        status=VideoStatus.COLD
+    )
+    test_db.add(asset)
+    test_db.commit()
+
+    # Simulate Redis connection failure during enqueue
+    with patch.object(Queue, "enqueue", side_effect=redis_exceptions.ConnectionError("Redis down")):
+        with pytest.raises(QueueUnavailableError):
+            dispatch_progressive_job(asset, QUEUE_PRIORITY, test_db, redis_conn=redis_conn)
+
+    # State in PostgreSQL: Asset is QUEUED, Job is PENDING with queue_name = vod_priority
+    test_db.expire_all()
+    asset_db = test_db.query(Asset).filter(Asset.vod_uuid == vod_uuid).first()
+    assert asset_db.status == VideoStatus.QUEUED
+
+    job_db = test_db.query(Job).filter(Job.asset_id == asset_db.id).first()
+    assert job_db is not None
+    assert job_db.status == JobStatus.PENDING
+    assert job_db.queue_name == QUEUE_PRIORITY
+
+    # Redis has 0 jobs currently
+    q_prio = get_queue(QUEUE_PRIORITY, redis_conn)
+    q_batch = get_queue(QUEUE_BATCH, redis_conn)
+    q_legacy = get_queue(QUEUE_LEGACY, redis_conn)
+    assert q_prio.count == 0
+
+    # Run reconciler to recover
+    with patch('src.scripts.reconcile_jobs.SessionLocal', side_effect=TestingSessionLocal):
+        reconcile_jobs()
+
+    # Reconciler recovered job strictly into vod_priority!
+    assert q_prio.count == 1
+    assert q_batch.count == 0
+    assert q_legacy.count == 0
+
+# 29, 30. Fallo Redis en dispatch inicial batch queda recuperable y reconciler recupera en batch
+def test_dispatch_batch_redis_failure_recovery(test_db, redis_conn):
+    vod_uuid = uuid.uuid4()
+    asset = Asset(
+        vod_uuid=vod_uuid,
+        enlace_id="PREDI-REDIS-BATCH",
+        source_uri="batch.mp4",
+        status=VideoStatus.COLD
+    )
+    test_db.add(asset)
+    test_db.commit()
+
+    # Simulate Redis connection failure during enqueue
+    with patch.object(Queue, "enqueue", side_effect=redis_exceptions.ConnectionError("Redis down")):
+        with pytest.raises(QueueUnavailableError):
+            dispatch_progressive_job(asset, QUEUE_BATCH, test_db, redis_conn=redis_conn)
+
+    # State in PostgreSQL: Asset is QUEUED, Job is PENDING with queue_name = vod_batch
+    test_db.expire_all()
+    asset_db = test_db.query(Asset).filter(Asset.vod_uuid == vod_uuid).first()
+    assert asset_db.status == VideoStatus.QUEUED
+
+    job_db = test_db.query(Job).filter(Job.asset_id == asset_db.id).first()
+    assert job_db is not None
+    assert job_db.status == JobStatus.PENDING
+    assert job_db.queue_name == QUEUE_BATCH
+
+    # Redis has 0 jobs currently
+    q_prio = get_queue(QUEUE_PRIORITY, redis_conn)
+    q_batch = get_queue(QUEUE_BATCH, redis_conn)
+    q_legacy = get_queue(QUEUE_LEGACY, redis_conn)
+    assert q_batch.count == 0
+
+    # Run reconciler to recover
+    with patch('src.scripts.reconcile_jobs.SessionLocal', side_effect=TestingSessionLocal):
+        reconcile_jobs()
+
+    # Reconciler recovered job strictly into vod_batch!
+    assert q_batch.count == 1
+    assert q_prio.count == 0
+    assert q_legacy.count == 0
+
+# 31. Reconciler repetido es estrictamente idempotente (no duplica jobs)
+def test_reconciler_repeated_runs_never_duplicate(test_db, redis_conn):
+    vod_uuid = uuid.uuid4()
+    asset = Asset(
+        vod_uuid=vod_uuid,
+        enlace_id="PREDI-IDEM-REC",
+        source_uri="rec.mp4",
+        status=VideoStatus.QUEUED
+    )
+    test_db.add(asset)
+    test_db.commit()
+
+    job = Job(
+        asset_id=asset.id,
+        type=JobType.TRANSCODE,
+        status=JobStatus.PENDING,
+        queue_name=QUEUE_PRIORITY
+    )
+    test_db.add(job)
+    test_db.commit()
+
+    # Run reconciler 3 times consecutively
+    with patch('src.scripts.reconcile_jobs.SessionLocal', side_effect=TestingSessionLocal):
+        reconcile_jobs()
+        reconcile_jobs()
+        reconcile_jobs()
+
+    q_prio = get_queue(QUEUE_PRIORITY, redis_conn)
+    q_batch = get_queue(QUEUE_BATCH, redis_conn)
+    q_legacy = get_queue(QUEUE_LEGACY, redis_conn)
+
+    # Exactly 1 job in priority, 0 in others
+    assert q_prio.count == 1
+    assert q_batch.count == 0
+    assert q_legacy.count == 0
+
+    # Active DB jobs per asset <= 1
+    all_jobs = test_db.query(Job).filter(Job.asset_id == asset.id).all()
+    assert len(all_jobs) == 1
+
+# 32. Carrera promoción vs batch worker: garantiza <= 1 job ejecutable/started
+def test_race_promotion_vs_batch_worker_strict_bound(test_db, redis_conn):
+    vod_uuid = uuid.uuid4()
+    asset = Asset(
+        vod_uuid=vod_uuid,
+        enlace_id="PREDI-RACE-STRICT",
+        source_uri="race.mp4",
+        status=VideoStatus.COLD
+    )
+    test_db.add(asset)
+    test_db.commit()
+
+    # Enqueue to batch
+    batch_res = batch_enqueue_asset(vod_uuid, db=test_db, redis_conn=redis_conn)
+    assert batch_res["status"] == "ENQUEUED_BATCH"
+
+    job = test_db.query(Job).filter(Job.asset_id == asset.id).first()
+    q_batch = get_queue(QUEUE_BATCH, redis_conn)
+    q_prio = get_queue(QUEUE_PRIORITY, redis_conn)
+
+    # Worker starts running it
+    rq_job = RQJob.fetch(str(job.rq_job_id or job.id), connection=redis_conn)
+    rq_job.set_status(RQJobStatus.STARTED)
+    rq_job.save()
+    # Simulate removal from queued list as worker took it
+    q_batch.remove(rq_job.id)
+
+    # Prepare-playback triggers promotion during race
+    promo_res = promote_batch_to_priority(job, asset, test_db, redis_conn=redis_conn)
+    assert promo_res["action"] == "REUSE_STARTED"
+
+    # Verify: 0 executable jobs in priority, 0 in batch queued
+    assert q_prio.count == 0
+    assert q_batch.count == 0
+
+    # Total executable RQ jobs across all queues <= 1
+    total_queued = q_prio.count + q_batch.count
+    assert total_queued == 0
+    assert job.status == JobStatus.PROCESSING
+
