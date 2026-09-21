@@ -41,15 +41,34 @@ IGNORED_DIR_NAMES = {
     "run",
 }
 
+def validate_enlace_id(stem: str) -> tuple[bool, Optional[str]]:
+    """
+    Validates that a filename stem strictly conforms to canonical enlace_id format.
+    No trimming, no replacement, no transformation.
+    Must match ^[A-Za-z0-9_-]{1,128}$ exactly.
+    """
+    if not stem:
+        return False, "enlace_id is empty or non-derivable"
+    if len(stem) > 128:
+        return False, "enlace_id exceeds maximum length of 128 characters"
+    if " " in stem:
+        return False, "enlace_id contains whitespace"
+    if "." in stem:
+        return False, "enlace_id contains dots"
+    if not ENLACE_ID_REGEX.fullmatch(stem):
+        return False, "enlace_id contains unsupported characters"
+    return True, None
+
 def derive_enlace_id(path: Union[str, Path]) -> Optional[str]:
     """
     Centralized function to derive and validate an enlace_id from a file path.
-    Rule:
-      1. Filename stem (without extension).
+    Strict Preservation Principle:
+      1. Obtains strictly Path(path).stem without any transformation, trim, or case modification.
       2. Must have an allowed video extension.
       3. Must NOT be a hidden file (e.g. .DS_Store, .gitkeep).
-      4. Must match ENLACE_ID_REGEX: ^[A-Za-z0-9_-]{1,128}$
-    Returns the exact enlace_id string if valid, or None if invalid.
+      4. Validates that Path(path).stem matches ^[A-Za-z0-9_-]{1,128}$ exactly.
+    Returns:
+      The exact stem string if valid (derive_enlace_id(f) == Path(f).stem), or None if invalid.
     """
     p = Path(path)
     filename = p.name
@@ -63,7 +82,8 @@ def derive_enlace_id(path: Union[str, Path]) -> Optional[str]:
         return None
 
     stem = p.stem
-    if not ENLACE_ID_REGEX.match(stem):
+    is_valid, _ = validate_enlace_id(stem)
+    if not is_valid:
         return None
 
     return stem
@@ -145,7 +165,10 @@ def scan_catalog_files(
                 except ValueError:
                     rel_str = filename
                 invalid_items.append({
+                    "result": "SYMLINK_REJECTED",
+                    "source_uri": rel_str,
                     "path": rel_str,
+                    "filename_stem": file_path.stem,
                     "reason": "SYMLINK_REJECTED",
                     "detail": "Symlinks are strictly prohibited"
                 })
@@ -158,8 +181,11 @@ def scan_catalog_files(
                 secure_resolve(resolved_root, rel_path)
             except (SecurityError, ValueError) as e:
                 invalid_items.append({
+                    "result": "SECURITY_VIOLATION",
+                    "source_uri": filename,
                     "path": filename,
-                    "reason": "SECURITY_VIOLATION",
+                    "filename_stem": file_path.stem,
+                    "reason": str(e),
                     "detail": str(e)
                 })
                 continue
@@ -168,18 +194,36 @@ def scan_catalog_files(
             ext = file_path.suffix.lower()
             if ext not in ALLOWED_EXTENSIONS:
                 invalid_items.append({
+                    "result": "SKIPPED_UNSUPPORTED_EXTENSION",
+                    "source_uri": rel_path,
                     "path": rel_path,
-                    "reason": "SKIPPED_UNSUPPORTED_EXTENSION",
+                    "filename_stem": file_path.stem,
+                    "reason": f"Extension '{ext}' not in supported video formats",
                     "detail": f"Extension '{ext}' not in supported video formats"
                 })
                 continue
 
-            # Derive enlace_id
+            # Derive enlace_id with strict stem preservation
+            is_valid_id, id_reason = validate_enlace_id(file_path.stem)
+            if not is_valid_id:
+                invalid_items.append({
+                    "result": "SKIPPED_INVALID_ENLACE_ID",
+                    "source_uri": rel_path,
+                    "path": rel_path,
+                    "filename_stem": file_path.stem,
+                    "reason": id_reason or "enlace_id contains unsupported characters",
+                    "detail": f"Filename '{filename}' cannot derive a valid enlace_id: {id_reason}"
+                })
+                continue
+
             enlace_id = derive_enlace_id(file_path)
             if not enlace_id:
                 invalid_items.append({
+                    "result": "SKIPPED_INVALID_ENLACE_ID",
+                    "source_uri": rel_path,
                     "path": rel_path,
-                    "reason": "SKIPPED_INVALID_ENLACE_ID",
+                    "filename_stem": file_path.stem,
+                    "reason": "enlace_id contains unsupported characters",
                     "detail": f"Filename '{filename}' cannot derive a valid enlace_id matching ^[A-Za-z0-9_-]{{1,128}}$"
                 })
                 continue
