@@ -353,23 +353,64 @@ def test_missing_metadata_stays_metadata_pending(test_db, ingest_folder):
 
 
 def test_invalid_enlace_id_marks_failed(test_db, ingest_folder):
-    video = ingest_folder / "bad_id.mp4"
-    video.write_bytes(b"content")
+    # Test cases: dot, space, @, leading/trailing whitespace, >128 chars
+    invalid_cases = [
+        ("bad_dot.mp4", "PREDI.TEST", "contains_dots"),
+        ("bad_space.mp4", "PREDI TEST", "whitespace"),
+        ("bad_at.mp4", "PREDI@TEST", "unsupported_characters"),
+        ("bad_leading.mp4", " PREDI-TEST", "whitespace"),
+        ("bad_trailing.mp4", "PREDI-TEST ", "whitespace"),
+        ("bad_long.mp4", "A" * 129, "too_long"),
+    ]
 
-    mock_meta_provider = MagicMock()
-    mock_meta_provider.get_metadata.return_value = NewVideoMetadata(
-        enlace_id="invalid/slash/id",
-        title="Bad ID Video"
-    )
+    for fname, bad_id, expected_reason in invalid_cases:
+        video = ingest_folder / fname
+        video.write_bytes(b"content")
 
-    # First scan -> WAITING_STABLE
-    scan_new_videos(root_path=str(ingest_folder), stable_seconds=0, metadata_provider=mock_meta_provider, db=test_db)
-    # Second scan -> FAILED due to bad ID
-    scan_new_videos(root_path=str(ingest_folder), stable_seconds=0, metadata_provider=mock_meta_provider, db=test_db)
+        mock_meta_provider = MagicMock()
+        mock_meta_provider.get_metadata.return_value = NewVideoMetadata(
+            enlace_id=bad_id,
+            title="Bad ID Video"
+        )
 
-    item = test_db.query(IngestItem).filter(IngestItem.filename == "bad_id.mp4").first()
-    assert item.status == IngestStatus.FAILED
-    assert "Invalid enlace_id" in item.last_error
+        # First scan -> WAITING_STABLE
+        scan_new_videos(root_path=str(ingest_folder), stable_seconds=0, metadata_provider=mock_meta_provider, db=test_db)
+        # Second scan -> FAILED due to bad ID
+        scan_new_videos(root_path=str(ingest_folder), stable_seconds=0, metadata_provider=mock_meta_provider, db=test_db)
+
+        item = test_db.query(IngestItem).filter(IngestItem.filename == fname).first()
+        assert item.status == IngestStatus.FAILED
+        assert "Invalid enlace_id" in item.last_error
+        assert expected_reason in item.last_error
+
+        # Ensure NO Asset, NO Job, NO Redis created
+        assert item.asset_id is None
+        assert test_db.query(Asset).filter(Asset.enlace_id == bad_id).first() is None
+
+
+def test_shared_central_enlace_id_validator():
+    from src.core.enlace_id import validate_enlace_id as central_validator
+    from src.services.catalog_ingest import validate_enlace_id as catalog_validator
+    from src.services.new_video_scanner import validate_enlace_id as scanner_validator
+
+    # Both must be the EXACT same function reference
+    assert catalog_validator is central_validator
+    assert scanner_validator is central_validator
+
+    # Verify standard cases
+    assert central_validator("PREDI-ABC123")[0] is True
+    assert central_validator("PREDI_ABC123")[0] is True
+    assert central_validator("predi-abc123")[0] is True
+
+    assert central_validator("PREDI.ABC123") == (False, "contains_dots")
+    assert central_validator("PREDI ABC123") == (False, "whitespace")
+    assert central_validator("PREDI@ABC123") == (False, "unsupported_characters")
+    assert central_validator(" PREDI-ABC123") == (False, "whitespace")
+    assert central_validator("PREDI-ABC123 ") == (False, "whitespace")
+    assert central_validator("A" * 129) == (False, "too_long")
+    assert central_validator("A" * 128) == (True, None)
+    assert central_validator("") == (False, "empty")
+    assert central_validator(None) == (False, "empty")
 
 
 def test_duplicate_enlace_id_different_source_marks_conflict(test_db, ingest_folder, redis_conn):

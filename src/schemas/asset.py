@@ -4,7 +4,7 @@ import uuid
 from typing import Optional, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, field_serializer, model_validator
 
-ENLACE_ID_REGEX = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+from src.core.enlace_id import ENLACE_ID_REGEX, require_valid_enlace_id, InvalidEnlaceIdError
 
 class AssetCreate(BaseModel):
     enlace_id: str
@@ -13,9 +13,10 @@ class AssetCreate(BaseModel):
     @field_validator('enlace_id')
     @classmethod
     def validate_enlace_id(cls, v: str) -> str:
-        if not ENLACE_ID_REGEX.match(v):
-            raise ValueError("enlace_id must match ^[A-Za-z0-9_-]{1,128}$")
-        return v
+        try:
+            return require_valid_enlace_id(v)
+        except InvalidEnlaceIdError as e:
+            raise ValueError(f"enlace_id must match ^[A-Za-z0-9_-]{{1,128}}: {e.reason}") from e
         
     @field_validator('source_uri')
     @classmethod
