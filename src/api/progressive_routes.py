@@ -352,3 +352,466 @@ def progressive_player(session_uuid: Optional[str] = None):
 </body>
 </html>"""
     return HTMLResponse(content=html_content)
+
+
+@router.get("/asset-player/ui", response_class=HTMLResponse)
+def asset_player(vod_uuid: Optional[str] = None):
+    initial_uuid = vod_uuid or ""
+    html_content = f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VOD Asset Player — Progressive HLS</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: #0b0f19;
+            color: #f1f5f9;
+            margin: 0;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }}
+        .container {{
+            width: 100%;
+            max-width: 960px;
+            background: #151d2f;
+            border: 1px solid #1e293b;
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 15px 30px -10px rgba(0, 0, 0, 0.6);
+        }}
+        .header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #1e293b;
+            padding-bottom: 16px;
+            margin-bottom: 20px;
+        }}
+        h1 {{
+            margin: 0;
+            font-size: 1.4rem;
+            color: #38bdf8;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }}
+        .badge {{
+            font-size: 0.75rem;
+            padding: 4px 10px;
+            border-radius: 9999px;
+            text-transform: uppercase;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+        }}
+        .badge-COLD {{ background: #334155; color: #94a3b8; }}
+        .badge-QUEUED {{ background: #1e3a8a; color: #93c5fd; }}
+        .badge-PROCESSING {{ background: #854d0e; color: #fef08a; }}
+        .badge-PLAYABLE {{ background: #15803d; color: #86efac; }}
+        .badge-VALIDATING {{ background: #6b21a8; color: #d8b4fe; }}
+        .badge-READY {{ background: #047857; color: #a7f3d0; }}
+        .badge-FAILED {{ background: #991b1b; color: #fecaca; }}
+        
+        .input-row {{
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }}
+        input[type="text"] {{
+            flex: 1;
+            background: #0b0f19;
+            border: 1px solid #334155;
+            color: #f8fafc;
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            font-family: monospace;
+        }}
+        input[type="text"]:focus {{
+            outline: none;
+            border-color: #38bdf8;
+        }}
+        button {{
+            background: #0284c7;
+            color: white;
+            border: none;
+            padding: 10px 18px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.95rem;
+            transition: background 0.15s;
+        }}
+        button:hover {{
+            background: #0369a1;
+        }}
+        button:disabled {{
+            background: #334155;
+            color: #64748b;
+            cursor: not-allowed;
+        }}
+        .btn-prepare {{
+            background: #16a34a;
+        }}
+        .btn-prepare:hover:not(:disabled) {{
+            background: #15803d;
+        }}
+
+        .video-wrapper {{
+            position: relative;
+            width: 100%;
+            background: #000;
+            border-radius: 8px;
+            overflow: hidden;
+            margin-bottom: 20px;
+            aspect-ratio: 16 / 9;
+            border: 1px solid #1e293b;
+        }}
+        video {{
+            width: 100%;
+            height: 100%;
+            display: block;
+        }}
+        .metrics-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            margin-bottom: 20px;
+        }}
+        .card {{
+            background: #0b0f19;
+            border: 1px solid #1e293b;
+            padding: 12px 14px;
+            border-radius: 8px;
+        }}
+        .card-label {{
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            color: #64748b;
+            letter-spacing: 0.05em;
+            margin-bottom: 4px;
+        }}
+        .card-value {{
+            font-size: 1.15rem;
+            font-weight: 600;
+            color: #f1f5f9;
+        }}
+        .progress-bar-container {{
+            width: 100%;
+            background: #1e293b;
+            height: 10px;
+            border-radius: 5px;
+            overflow: hidden;
+            margin-top: 6px;
+        }}
+        .progress-bar {{
+            height: 100%;
+            background: linear-gradient(90deg, #0284c7, #38bdf8);
+            width: 0%;
+            transition: width 0.3s ease;
+        }}
+        .info-panel {{
+            background: #0b0f19;
+            border: 1px solid #1e293b;
+            border-radius: 8px;
+            padding: 12px 16px;
+            font-family: monospace;
+            font-size: 0.85rem;
+            color: #94a3b8;
+            margin-bottom: 20px;
+        }}
+        .info-row {{
+            display: flex;
+            margin-bottom: 6px;
+        }}
+        .info-row:last-child {{
+            margin-bottom: 0;
+        }}
+        .info-label {{
+            width: 150px;
+            color: #64748b;
+        }}
+        .info-val {{
+            color: #38bdf8;
+            word-break: break-all;
+        }}
+        .log-container {{
+            background: #050811;
+            border: 1px solid #1e293b;
+            border-radius: 8px;
+            padding: 12px;
+            font-family: monospace;
+            font-size: 0.8rem;
+            max-height: 180px;
+            overflow-y: auto;
+        }}
+        .log-entry {{
+            padding: 3px 0;
+            border-bottom: 1px solid #0f172a;
+        }}
+        .log-entry:last-child {{
+            border-bottom: none;
+        }}
+        .log-time {{
+            color: #475569;
+            margin-right: 8px;
+        }}
+        .log-state {{
+            font-weight: bold;
+            color: #38bdf8;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>
+                <span>VOD Asset Player</span>
+                <span id="statusBadge" class="badge badge-COLD">UNKNOWN</span>
+            </h1>
+            <div>
+                <button id="btnPrepare" class="btn-prepare" onclick="preparePlayback()" disabled>Preparar Reproducción</button>
+            </div>
+        </div>
+
+        <div class="input-row">
+            <input type="text" id="vodUuidInput" placeholder="Ingrese vod_uuid (ej: 217CBED8-667B-4A9B-B000-D3003160B0C5)" value="{initial_uuid}">
+            <button onclick="loadAsset()">Cargar Asset</button>
+        </div>
+
+        <div class="video-wrapper">
+            <video id="player" controls playsinline></video>
+        </div>
+
+        <div class="metrics-grid">
+            <div class="card">
+                <div class="card-label">Estado</div>
+                <div class="card-value" id="statusVal">-</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Reproducible (Playable)</div>
+                <div class="card-value" id="playableVal">-</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Progreso</div>
+                <div class="card-value" id="progressVal">0%</div>
+                <div class="progress-bar-container">
+                    <div class="progress-bar" id="progressBar"></div>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-label">Disponible Hasta</div>
+                <div class="card-value" id="availableVal">0.0s</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Duración Total</div>
+                <div class="card-value" id="durationVal">-</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Estado del Reproductor</div>
+                <div class="card-value" id="mountVal" style="font-size: 0.95rem; color: #94a3b8;">No montado</div>
+            </div>
+        </div>
+
+        <div class="info-panel">
+            <div class="info-row">
+                <div class="info-label">enlace_id:</div>
+                <div class="info-val" id="enlaceIdText">-</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">vod_uuid:</div>
+                <div class="info-val" id="uuidText">-</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">manifest_url:</div>
+                <div class="info-val"><a id="manifestLink" href="#" target="_blank" style="color: #38bdf8; text-decoration: none;">-</a></div>
+            </div>
+        </div>
+
+        <div class="card-label" style="margin-bottom: 6px;">Historial de Estados</div>
+        <div class="log-container" id="logContainer">
+            <div class="log-entry"><span class="log-time">--:--:--</span> Esperando asset...</div>
+        </div>
+    </div>
+
+    <script>
+        let currentVodUuid = "{initial_uuid}";
+        let pollInterval = null;
+        let hls = null;
+        let isMounted = false;
+        let lastStatus = null;
+
+        const player = document.getElementById('player');
+        const statusBadge = document.getElementById('statusBadge');
+        const btnPrepare = document.getElementById('btnPrepare');
+        const statusVal = document.getElementById('statusVal');
+        const playableVal = document.getElementById('playableVal');
+        const progressVal = document.getElementById('progressVal');
+        const progressBar = document.getElementById('progressBar');
+        const availableVal = document.getElementById('availableVal');
+        const durationVal = document.getElementById('durationVal');
+        const mountVal = document.getElementById('mountVal');
+        const enlaceIdText = document.getElementById('enlaceIdText');
+        const uuidText = document.getElementById('uuidText');
+        const manifestLink = document.getElementById('manifestLink');
+        const logContainer = document.getElementById('logContainer');
+
+        function addLog(msg) {{
+            const now = new Date().toTimeString().split(' ')[0];
+            const div = document.createElement('div');
+            div.className = 'log-entry';
+            div.innerHTML = `<span class="log-time">[${{now}}]</span> ${{msg}}`;
+            logContainer.appendChild(div);
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }}
+
+        function updateBadge(status) {{
+            statusBadge.className = 'badge badge-' + status;
+            statusBadge.innerText = status;
+        }}
+
+        function loadAsset() {{
+            const inputVal = document.getElementById('vodUuidInput').value.trim();
+            if (!inputVal) return;
+            currentVodUuid = inputVal;
+            window.history.replaceState(null, '', `?vod_uuid=${{currentVodUuid}}`);
+            isMounted = false;
+            lastStatus = null;
+            mountVal.innerText = 'No montado';
+            mountVal.style.color = '#94a3b8';
+            addLog(`Cargando asset ${{currentVodUuid}}`);
+            startPolling();
+        }}
+
+        async function preparePlayback() {{
+            if (!currentVodUuid) return;
+            btnPrepare.disabled = true;
+            addLog(`Solicitando /prepare-playback para ${{currentVodUuid}}...`);
+            try {{
+                const res = await fetch(`/api/v1/assets/${{currentVodUuid}}/prepare-playback`, {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }}
+                }});
+                const data = await res.json();
+                if (!res.ok) {{
+                    addLog(`Error en prepare-playback: ${{data.detail || JSON.stringify(data)}}`);
+                }} else {{
+                    addLog(`Respuesta prepare-playback: status=${{data.status}}, playable=${{data.playable}}`);
+                    fetchAssetStatus();
+                }}
+            }} catch (e) {{
+                addLog(`Excepción en prepare-playback: ${{e.message}}`);
+            }}
+        }}
+
+        function mountPlayer(manifestUrl) {{
+            if (isMounted) return;
+            isMounted = true;
+            mountVal.innerText = 'Montado y reproduciendo';
+            mountVal.style.color = '#86efac';
+            addLog(`Montando reproductor con URL canónica: ${{manifestUrl}}`);
+
+            if (Hls.isSupported()) {{
+                if (hls) hls.destroy();
+                hls = new Hls({{
+                    liveSyncPosition: false,
+                    enableWorker: true,
+                    lowLatencyMode: false
+                }});
+                hls.loadSource(manifestUrl);
+                hls.attachMedia(player);
+                hls.on(Hls.Events.MANIFEST_PARSED, function () {{
+                    addLog('Manifest HLS parseado con éxito, iniciando reproducción.');
+                    player.play().catch(e => console.log('Autoplay bloqueado:', e));
+                }});
+                hls.on(Hls.Events.ERROR, function (event, data) {{
+                    if (data.fatal) {{
+                        addLog(`Error fatal HLS: ${{data.details}}`);
+                    }}
+                }});
+            }} else if (player.canPlayType('application/vnd.apple.mpegurl')) {{
+                player.src = manifestUrl;
+                player.play().catch(e => console.log('Autoplay bloqueado:', e));
+            }} else {{
+                mountVal.innerText = 'HLS no soportado en este navegador';
+                mountVal.style.color = '#f87171';
+            }}
+        }}
+
+        async function fetchAssetStatus() {{
+            if (!currentVodUuid) return;
+            try {{
+                const res = await fetch(`/api/v1/assets/${{currentVodUuid}}`);
+                if (!res.ok) {{
+                    if (res.status === 404) {{
+                        statusVal.innerText = 'NO ENCONTRADO (404)';
+                        updateBadge('FAILED');
+                        return;
+                    }}
+                }}
+                const data = await res.json();
+                const st = (data.status || '').toUpperCase();
+
+                if (st !== lastStatus) {{
+                    addLog(`Transición de estado: <span class="log-state">${{st}}</span> (progreso: ${{data.progress}}%)`);
+                    lastStatus = st;
+                }}
+
+                updateBadge(st);
+                statusVal.innerText = st;
+                enlaceIdText.innerText = data.enlace_id || '-';
+                uuidText.innerText = data.vod_uuid || '-';
+                
+                playableVal.innerText = data.playable ? 'SÍ (True)' : 'NO (False)';
+                playableVal.style.color = data.playable ? '#86efac' : '#94a3b8';
+
+                progressVal.innerText = `${{data.progress || 0}}%`;
+                progressBar.style.width = `${{data.progress || 0}}%`;
+
+                availableVal.innerText = data.available_until_seconds != null ? `${{Number(data.available_until_seconds).toFixed(1)}}s` : 'N/A';
+                durationVal.innerText = data.duration_seconds != null ? `${{Number(data.duration_seconds).toFixed(1)}}s` : 'Desconocida';
+
+                if (data.manifest_url) {{
+                    manifestLink.innerText = data.manifest_url;
+                    manifestLink.href = data.manifest_url;
+                }}
+
+                // Control del botón Preparar
+                if (st === 'COLD' || st === 'FAILED') {{
+                    btnPrepare.disabled = false;
+                }} else {{
+                    btnPrepare.disabled = true;
+                }}
+
+                // Si es playable o READY y no se ha montado el player, montarlo
+                if ((data.playable || st === 'PLAYABLE' || st === 'VALIDATING' || st === 'READY') && !isMounted && data.manifest_url) {{
+                    mountPlayer(data.manifest_url);
+                }}
+
+                if (st === 'READY' || st === 'FAILED') {{
+                    clearInterval(pollInterval);
+                    pollInterval = setInterval(fetchAssetStatus, 5000);
+                }}
+            }} catch (e) {{
+                console.error('Error polling asset:', e);
+            }}
+        }}
+
+        function startPolling() {{
+            if (pollInterval) clearInterval(pollInterval);
+            fetchAssetStatus();
+            pollInterval = setInterval(fetchAssetStatus, 1000);
+        }}
+
+        if (currentVodUuid) {{
+            document.getElementById('vodUuidInput').value = currentVodUuid;
+            startPolling();
+        }}
+    </script>
+</body>
+</html>"""
+    return HTMLResponse(content=html_content)

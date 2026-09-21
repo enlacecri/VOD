@@ -13,7 +13,7 @@ from src.core.config import settings
 from src.core.startup import validate_environment
 from src.api.routes import router as api_router
 from src.api.admin_routes import router as admin_router
-from src.api.progressive_routes import router as progressive_router, progressive_player
+from src.api.progressive_routes import router as progressive_router, progressive_player, asset_player
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,6 +43,10 @@ app.mount("/admin-static", StaticFiles(directory=static_dir), name="admin-static
 @app.get("/experimental/progressive-player", include_in_schema=False)
 def progressive_player_page(session_uuid: str = None):
     return progressive_player(session_uuid)
+
+@app.get("/experimental/asset-player", include_in_schema=False)
+def asset_player_page(vod_uuid: str = None):
+    return asset_player(vod_uuid)
 
 
 @app.get("/admin", include_in_schema=False)

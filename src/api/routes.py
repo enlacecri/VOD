@@ -8,8 +8,9 @@ from sqlalchemy.exc import IntegrityError
 from src.core.database import get_db
 from src.core.config import settings
 from src.core.admin_auth import require_admin_api_key
+from src.core.canonical import build_canonical_manifest_path, build_canonical_manifest_url, get_canonical_output_dir
 from src.models.asset import Asset
-from src.schemas.asset import AssetCreate, AssetResponse
+from src.schemas.asset import AssetCreate, AssetResponse, ColdAssetCreate, PreparePlaybackResponse
 
 router = APIRouter()
 
@@ -36,11 +37,14 @@ def create_asset(payload: AssetCreate, db: Session = Depends(get_db)):
         )
     
     # Intento de crear asset idempotente
+    vod_uuid = uuid.uuid4()
     new_asset = Asset(
-        vod_uuid=uuid.uuid4(),
+        vod_uuid=vod_uuid,
         enlace_id=payload.enlace_id,
         source_uri=payload.source_uri,
-        status=VideoStatus.CREATED
+        status=VideoStatus.CREATED,
+        manifest_url=build_canonical_manifest_url(vod_uuid, payload.enlace_id),
+        manifest_path=build_canonical_manifest_path(vod_uuid, payload.enlace_id)
     )
     
     try:
@@ -260,6 +264,186 @@ def retry_asset(vod_uuid: uuid.UUID, db: Session = Depends(get_db), _admin: None
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"error_code": "E_QUEUE_UNAVAILABLE", "message": "Failed to enqueue job"}
         )
+
+@router.post("/experimental/cold-assets", response_model=AssetResponse, status_code=status.HTTP_201_CREATED)
+def create_cold_asset(payload: ColdAssetCreate, db: Session = Depends(get_db)):
+    from src.models.enums import VideoStatus
+    from fastapi.responses import JSONResponse
+    from fastapi.encoders import jsonable_encoder
+
+    try:
+        validate_ingest_path(payload.source_uri)
+    except SecurityError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail=f"{e.code}: {e.message}"
+        )
+
+    vod_uuid = uuid.uuid4()
+    manifest_url = build_canonical_manifest_url(vod_uuid, payload.enlace_id)
+    manifest_path = build_canonical_manifest_path(vod_uuid, payload.enlace_id)
+
+    new_asset = Asset(
+        vod_uuid=vod_uuid,
+        enlace_id=payload.enlace_id,
+        source_uri=payload.source_uri,
+        status=VideoStatus.COLD,
+        manifest_url=manifest_url,
+        manifest_path=manifest_path,
+        progress=0
+    )
+
+    try:
+        db.add(new_asset)
+        db.commit()
+        db.refresh(new_asset)
+        return new_asset
+    except IntegrityError:
+        db.rollback()
+        existing_asset = db.query(Asset).filter(Asset.enlace_id == payload.enlace_id).first()
+        if existing_asset:
+            if existing_asset.source_uri != payload.source_uri:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Conflict: enlace_id exists with a different source_uri."
+                )
+            resp = jsonable_encoder(AssetResponse.model_validate(existing_asset))
+            resp["was_reused"] = True
+            return JSONResponse(status_code=status.HTTP_200_OK, content=resp)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Database integrity error"
+            )
+
+@router.post("/assets/{vod_uuid}/prepare-playback", response_model=PreparePlaybackResponse)
+def prepare_playback(vod_uuid: uuid.UUID, db: Session = Depends(get_db)):
+    from src.models.job import Job
+    from src.models.asset_event import AssetEvent
+    from src.models.enums import JobType, JobStatus, VideoStatus, EventType
+    from redis import Redis
+    from rq import Queue
+
+    # 1. Lock the asset to prevent concurrent race conditions
+    asset = db.query(Asset).filter(Asset.vod_uuid == vod_uuid).with_for_update().first()
+    if not asset:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail="Asset not found."
+        )
+
+    # 2. Check if already READY
+    if asset.status == VideoStatus.READY:
+        return PreparePlaybackResponse(
+            vod_uuid=asset.vod_uuid,
+            enlace_id=asset.enlace_id,
+            status=asset.status.name,
+            playable=True,
+            progress=asset.progress,
+            available_until_seconds=asset.available_until_seconds or asset.duration_seconds,
+            duration_seconds=asset.duration_seconds,
+            manifest_url=asset.manifest_url,
+            error_message=None
+        )
+
+    # 3. Check if already PLAYABLE or VALIDATING
+    if asset.status in (VideoStatus.PLAYABLE, VideoStatus.VALIDATING):
+        return PreparePlaybackResponse(
+            vod_uuid=asset.vod_uuid,
+            enlace_id=asset.enlace_id,
+            status=asset.status.name,
+            playable=True,
+            progress=asset.progress,
+            available_until_seconds=asset.available_until_seconds,
+            duration_seconds=asset.duration_seconds,
+            manifest_url=asset.manifest_url,
+            error_message=None
+        )
+
+    # 4. Check if already QUEUED or PROCESSING with active job
+    if asset.status in (VideoStatus.QUEUED, VideoStatus.PROCESSING):
+        active_job = db.query(Job).filter(
+            Job.asset_id == asset.id,
+            Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING])
+        ).first()
+        if active_job:
+            return PreparePlaybackResponse(
+                vod_uuid=asset.vod_uuid,
+                enlace_id=asset.enlace_id,
+                status=asset.status.name,
+                playable=False,
+                progress=asset.progress,
+                available_until_seconds=asset.available_until_seconds,
+                duration_seconds=asset.duration_seconds,
+                manifest_url=asset.manifest_url,
+                error_message=None
+            )
+
+    # 5. Asset is in COLD, CREATED, or FAILED: transition to QUEUED and enqueue progressive job
+    if not asset.manifest_url or not asset.manifest_path:
+        asset.manifest_url = build_canonical_manifest_url(asset.vod_uuid, asset.enlace_id)
+        asset.manifest_path = build_canonical_manifest_path(asset.vod_uuid, asset.enlace_id)
+
+    asset.status = VideoStatus.QUEUED
+    asset.error_code = None
+    asset.error_message = None
+
+    new_job = Job(
+        asset_id=asset.id,
+        type=JobType.TRANSCODE,
+        status=JobStatus.PENDING,
+        attempt=1,
+        max_attempts=settings.MAX_TRANSCODE_ATTEMPTS
+    )
+    db.add(new_job)
+    db.add(AssetEvent(
+        asset_id=asset.id,
+        event_type=EventType.TRANSITION,
+        details={"new_status": "QUEUED", "job_id": str(new_job.id), "context": "prepare-playback"}
+    ))
+    db.commit()
+    db.refresh(new_job)
+
+    try:
+        redis_conn = Redis.from_url(settings.REDIS_URL)
+        q = Queue(name=settings.RQ_QUEUE_NAME, connection=redis_conn)
+        existing_rq_job = q.fetch_job(str(new_job.id))
+        if existing_rq_job:
+            rq_job = existing_rq_job
+        else:
+            rq_job = q.enqueue(
+                "src.worker.tasks.progressive_transcode_asset_job", 
+                args=(new_job.id,),
+                job_id=str(new_job.id),
+                job_timeout=settings.FFMPEG_TIMEOUT_SECONDS + 300,
+                result_ttl=86400
+            )
+        new_job.rq_job_id = rq_job.id
+        db.commit()
+    except Exception as e:
+        asset.status = VideoStatus.FAILED
+        asset.error_code = "E_QUEUE_UNAVAILABLE"
+        asset.error_message = f"Could not enqueue progressive job: {e}"
+        new_job.status = JobStatus.FAILED
+        new_job.error_code = "E_QUEUE_UNAVAILABLE"
+        new_job.error_message = str(e)
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error_code": "E_QUEUE_UNAVAILABLE", "message": "Failed to enqueue job"}
+        )
+
+    return PreparePlaybackResponse(
+        vod_uuid=asset.vod_uuid,
+        enlace_id=asset.enlace_id,
+        status="QUEUED",
+        playable=False,
+        progress=0,
+        available_until_seconds=None,
+        duration_seconds=asset.duration_seconds,
+        manifest_url=asset.manifest_url,
+        error_message=None
+    )
 
 @router.get("/assets/by-enlace/{enlace_id}", response_model=AssetResponse)
 def get_asset_by_enlace(enlace_id: str, db: Session = Depends(get_db)):
