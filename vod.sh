@@ -20,23 +20,34 @@ LOGS_DIR="storage/logs/services"
 API_PID_FILE="$RUN_DIR/api.pid"
 WORKER_PID_FILE="$RUN_DIR/worker.pid"
 WORKER_PRIORITY_PID_FILE="$RUN_DIR/worker_priority.pid"
+WORKER_INGEST_PID_FILE="$RUN_DIR/worker_ingest.pid"
 WORKER_BATCH_PID_FILE="$RUN_DIR/worker_batch.pid"
+WORKER_BACKUP_PID_FILE="$RUN_DIR/worker_backup.pid"
+WORKER_SUBTITLES_PID_FILE="$RUN_DIR/worker_subtitles.pid"
+WORKER_SYNC_PID_FILE="$RUN_DIR/worker_sync.pid"
 
 API_LOG_FILE="$LOGS_DIR/api.log"
 WORKER_LOG_FILE="$LOGS_DIR/worker.log"
 WORKER_PRIORITY_LOG_FILE="$LOGS_DIR/worker_priority.log"
+WORKER_INGEST_LOG_FILE="$LOGS_DIR/worker_ingest.log"
 WORKER_BATCH_LOG_FILE="$LOGS_DIR/worker_batch.log"
+WORKER_BACKUP_LOG_FILE="$LOGS_DIR/worker_backup.log"
+WORKER_SUBTITLES_LOG_FILE="$LOGS_DIR/worker_subtitles.log"
+WORKER_SYNC_LOG_FILE="$LOGS_DIR/worker_sync.log"
 
 ALLOWED_EXTENSIONS=(".mp4" ".mov" ".mkv" ".mxf" ".avi" ".m4v")
 
-# Extraer INGEST_ROOT, VOD_API_PORT y VOD_NGINX_PORT del .env o default
+# Extraer INGEST_ROOT, VOD_NEW_INGEST_ROOT, VOD_API_PORT y VOD_NGINX_PORT del .env o default
 if [ -f .env ]; then
     INGEST_ROOT=$(grep -E "^INGEST_ROOT=" .env | cut -d '=' -f2 | tr -d '"' | tr -d "'")
+    VOD_NEW_INGEST_ROOT=$(grep -E "^VOD_NEW_INGEST_ROOT=" .env | cut -d '=' -f2 | tr -d '"' | tr -d "'")
     VOD_API_PORT=$(grep -E "^VOD_API_PORT=" .env | cut -d '=' -f2 | tr -d '"' | tr -d "'")
     VOD_NGINX_PORT=$(grep -E "^VOD_NGINX_PORT=" .env | cut -d '=' -f2 | tr -d '"' | tr -d "'")
 fi
 INGEST_ROOT=${INGEST_ROOT:-storage/input}
 INGEST_ROOT=$(echo "$INGEST_ROOT" | sed 's/^\.\///') # Limpiar ./ inicial si existe
+VOD_NEW_INGEST_ROOT=${VOD_NEW_INGEST_ROOT:-storage/new_input}
+VOD_NEW_INGEST_ROOT=$(echo "$VOD_NEW_INGEST_ROOT" | sed 's/^\.\///')
 VOD_API_PORT=${VOD_API_PORT:-8005}
 VOD_NGINX_PORT=${VOD_NGINX_PORT:-8085}
 
@@ -169,10 +180,16 @@ wait_for_db_redis() {
 cmd_start() {
     check_deps
     
-    mkdir -p "$RUN_DIR" "$LOGS_DIR" "$INGEST_ROOT"
+    mkdir -p "$RUN_DIR" "$LOGS_DIR" "$INGEST_ROOT" "$VOD_NEW_INGEST_ROOT"
     
     local api_started_this_run=0
     local worker_started_this_run=0
+    local worker_priority_started_this_run=0
+    local worker_ingest_started_this_run=0
+    local worker_batch_started_this_run=0
+    local worker_backup_started_this_run=0
+    local worker_subtitles_started_this_run=0
+    local worker_sync_started_this_run=0
 
     # Docker Compose (Always ensure containers are up)
     info "Iniciando contenedores Docker..."
@@ -204,6 +221,8 @@ cmd_start() {
         api_started_this_run=1
         success "API iniciada (PID: $(cat $API_PID_FILE))"
     fi
+
+    # --- Transcode Workers ---
     if check_pid_running "$WORKER_PID_FILE" "run_worker"; then
         warning "El Legacy Worker ya estaba iniciado (PID: $(cat $WORKER_PID_FILE))."
     else
@@ -224,6 +243,16 @@ cmd_start() {
         success "Priority Worker iniciado (PID: $(cat $WORKER_PRIORITY_PID_FILE))"
     fi
 
+    if check_pid_running "$WORKER_INGEST_PID_FILE" "run_worker"; then
+        warning "El Ingest Worker ya estaba iniciado (PID: $(cat $WORKER_INGEST_PID_FILE))."
+    else
+        echo -n "Iniciando Ingest Worker (vod_ingest)... "
+        "$VENV_PYTHON" src/scripts/run_worker.py --queue vod_ingest --name vod-ingest-worker > "$WORKER_INGEST_LOG_FILE" 2>&1 &
+        echo $! > "$WORKER_INGEST_PID_FILE"
+        worker_ingest_started_this_run=1
+        success "Ingest Worker iniciado (PID: $(cat $WORKER_INGEST_PID_FILE))"
+    fi
+
     if check_pid_running "$WORKER_BATCH_PID_FILE" "run_worker"; then
         warning "El Batch Worker ya estaba iniciado (PID: $(cat $WORKER_BATCH_PID_FILE))."
     else
@@ -232,6 +261,37 @@ cmd_start() {
         echo $! > "$WORKER_BATCH_PID_FILE"
         worker_batch_started_this_run=1
         success "Batch Worker iniciado (PID: $(cat $WORKER_BATCH_PID_FILE))"
+    fi
+
+    # --- Post-process Workers ---
+    if check_pid_running "$WORKER_BACKUP_PID_FILE" "run_worker"; then
+        warning "El Backup Worker ya estaba iniciado (PID: $(cat $WORKER_BACKUP_PID_FILE))."
+    else
+        echo -n "Iniciando Backup Worker (vod_backup)... "
+        "$VENV_PYTHON" src/scripts/run_worker.py --queue vod_backup --name vod-backup-worker > "$WORKER_BACKUP_LOG_FILE" 2>&1 &
+        echo $! > "$WORKER_BACKUP_PID_FILE"
+        worker_backup_started_this_run=1
+        success "Backup Worker iniciado (PID: $(cat $WORKER_BACKUP_PID_FILE))"
+    fi
+
+    if check_pid_running "$WORKER_SUBTITLES_PID_FILE" "run_worker"; then
+        warning "El Subtitles Worker ya estaba iniciado (PID: $(cat $WORKER_SUBTITLES_PID_FILE))."
+    else
+        echo -n "Iniciando Subtitles Worker (vod_subtitles)... "
+        "$VENV_PYTHON" src/scripts/run_worker.py --queue vod_subtitles --name vod-subtitles-worker > "$WORKER_SUBTITLES_LOG_FILE" 2>&1 &
+        echo $! > "$WORKER_SUBTITLES_PID_FILE"
+        worker_subtitles_started_this_run=1
+        success "Subtitles Worker iniciado (PID: $(cat $WORKER_SUBTITLES_PID_FILE))"
+    fi
+
+    if check_pid_running "$WORKER_SYNC_PID_FILE" "run_worker"; then
+        warning "El Sync Worker ya estaba iniciado (PID: $(cat $WORKER_SYNC_PID_FILE))."
+    else
+        echo -n "Iniciando Sync Worker (vod_sync)... "
+        "$VENV_PYTHON" src/scripts/run_worker.py --queue vod_sync --name vod-sync-worker > "$WORKER_SYNC_LOG_FILE" 2>&1 &
+        echo $! > "$WORKER_SYNC_PID_FILE"
+        worker_sync_started_this_run=1
+        success "Sync Worker iniciado (PID: $(cat $WORKER_SYNC_PID_FILE))"
     fi
 
     # Check API health
@@ -278,8 +338,20 @@ EOF
         if [ "$worker_priority_started_this_run" -eq 1 ]; then
             graceful_kill "$WORKER_PRIORITY_PID_FILE" "run_worker"
         fi
+        if [ "$worker_ingest_started_this_run" -eq 1 ]; then
+            graceful_kill "$WORKER_INGEST_PID_FILE" "run_worker"
+        fi
         if [ "$worker_batch_started_this_run" -eq 1 ]; then
             graceful_kill "$WORKER_BATCH_PID_FILE" "run_worker"
+        fi
+        if [ "$worker_backup_started_this_run" -eq 1 ]; then
+            graceful_kill "$WORKER_BACKUP_PID_FILE" "run_worker"
+        fi
+        if [ "$worker_subtitles_started_this_run" -eq 1 ]; then
+            graceful_kill "$WORKER_SUBTITLES_PID_FILE" "run_worker"
+        fi
+        if [ "$worker_sync_started_this_run" -eq 1 ]; then
+            graceful_kill "$WORKER_SYNC_PID_FILE" "run_worker"
         fi
         exit 1
     fi
@@ -324,8 +396,20 @@ EOF
         if [ "$worker_priority_started_this_run" -eq 1 ]; then
             graceful_kill "$WORKER_PRIORITY_PID_FILE" "run_worker"
         fi
+        if [ "$worker_ingest_started_this_run" -eq 1 ]; then
+            graceful_kill "$WORKER_INGEST_PID_FILE" "run_worker"
+        fi
         if [ "$worker_batch_started_this_run" -eq 1 ]; then
             graceful_kill "$WORKER_BATCH_PID_FILE" "run_worker"
+        fi
+        if [ "$worker_backup_started_this_run" -eq 1 ]; then
+            graceful_kill "$WORKER_BACKUP_PID_FILE" "run_worker"
+        fi
+        if [ "$worker_subtitles_started_this_run" -eq 1 ]; then
+            graceful_kill "$WORKER_SUBTITLES_PID_FILE" "run_worker"
+        fi
+        if [ "$worker_sync_started_this_run" -eq 1 ]; then
+            graceful_kill "$WORKER_SYNC_PID_FILE" "run_worker"
         fi
         exit 1
     fi
@@ -343,7 +427,11 @@ EOF
 
 cmd_stop() {
     info "Deteniendo servicios VOD..."
+    graceful_kill "$WORKER_SYNC_PID_FILE" "run_worker"
+    graceful_kill "$WORKER_SUBTITLES_PID_FILE" "run_worker"
+    graceful_kill "$WORKER_BACKUP_PID_FILE" "run_worker"
     graceful_kill "$WORKER_BATCH_PID_FILE" "run_worker"
+    graceful_kill "$WORKER_INGEST_PID_FILE" "run_worker"
     graceful_kill "$WORKER_PRIORITY_PID_FILE" "run_worker"
     graceful_kill "$WORKER_PID_FILE" "run_worker"
     graceful_kill "$API_PID_FILE" "uvicorn"
@@ -369,27 +457,53 @@ cmd_status() {
 
     echo -e "\n${CYAN}--- ESTADO DE PROCESOS ---${NC}"
     if check_pid_running "$API_PID_FILE" "uvicorn"; then
-        echo -e "API:             ${GREEN}Corriendo${NC} (PID: $(cat $API_PID_FILE))"
+        echo -e "API:              ${GREEN}Corriendo${NC} (PID: $(cat $API_PID_FILE))"
     else
-        echo -e "API:             ${RED}Detenida${NC}"
+        echo -e "API:              ${RED}Detenida${NC}"
     fi
 
-    if check_pid_running "$WORKER_PID_FILE" "run_worker"; then
-        echo -e "Legacy Worker:   ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_PID_FILE), Queue: vod_tasks)"
-    else
-        echo -e "Legacy Worker:   ${RED}Detenido${NC}"
-    fi
-
+    echo -e "\n${CYAN}TRANSCODE WORKERS:${NC}"
     if check_pid_running "$WORKER_PRIORITY_PID_FILE" "run_worker"; then
-        echo -e "Priority Worker: ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_PRIORITY_PID_FILE), Queue: vod_priority)"
+        echo -e "Priority Worker:  ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_PRIORITY_PID_FILE), Queue: vod_priority)"
     else
-        echo -e "Priority Worker: ${RED}Detenido${NC}"
+        echo -e "Priority Worker:  ${RED}Detenido${NC}"
+    fi
+
+    if check_pid_running "$WORKER_INGEST_PID_FILE" "run_worker"; then
+        echo -e "Ingest Worker:    ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_INGEST_PID_FILE), Queue: vod_ingest)"
+    else
+        echo -e "Ingest Worker:    ${RED}Detenido${NC}"
     fi
 
     if check_pid_running "$WORKER_BATCH_PID_FILE" "run_worker"; then
-        echo -e "Batch Worker:    ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_BATCH_PID_FILE), Queue: vod_batch)"
+        echo -e "Batch Worker:     ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_BATCH_PID_FILE), Queue: vod_batch)"
     else
-        echo -e "Batch Worker:    ${RED}Detenido${NC}"
+        echo -e "Batch Worker:     ${RED}Detenido${NC}"
+    fi
+
+    if check_pid_running "$WORKER_PID_FILE" "run_worker"; then
+        echo -e "Legacy Worker:    ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_PID_FILE), Queue: vod_tasks)"
+    else
+        echo -e "Legacy Worker:    ${RED}Detenido${NC}"
+    fi
+
+    echo -e "\n${CYAN}POST-PROCESS WORKERS:${NC}"
+    if check_pid_running "$WORKER_BACKUP_PID_FILE" "run_worker"; then
+        echo -e "Backup Worker:    ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_BACKUP_PID_FILE), Queue: vod_backup)"
+    else
+        echo -e "Backup Worker:    ${RED}Detenido${NC}"
+    fi
+
+    if check_pid_running "$WORKER_SUBTITLES_PID_FILE" "run_worker"; then
+        echo -e "Subtitles Worker: ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_SUBTITLES_PID_FILE), Queue: vod_subtitles)"
+    else
+        echo -e "Subtitles Worker: ${RED}Detenido${NC}"
+    fi
+
+    if check_pid_running "$WORKER_SYNC_PID_FILE" "run_worker"; then
+        echo -e "Sync Worker:      ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_SYNC_PID_FILE), Queue: vod_sync)"
+    else
+        echo -e "Sync Worker:      ${RED}Detenido${NC}"
     fi
 
     echo -e "\n${CYAN}--- HEALTHCHECKS ---${NC}"
@@ -440,6 +554,24 @@ cmd_logs() {
     fi
     if [ -f "$WORKER_LOG_FILE" ]; then
         files="$files $WORKER_LOG_FILE"
+    fi
+    if [ -f "$WORKER_PRIORITY_LOG_FILE" ]; then
+        files="$files $WORKER_PRIORITY_LOG_FILE"
+    fi
+    if [ -f "$WORKER_INGEST_LOG_FILE" ]; then
+        files="$files $WORKER_INGEST_LOG_FILE"
+    fi
+    if [ -f "$WORKER_BATCH_LOG_FILE" ]; then
+        files="$files $WORKER_BATCH_LOG_FILE"
+    fi
+    if [ -f "$WORKER_BACKUP_LOG_FILE" ]; then
+        files="$files $WORKER_BACKUP_LOG_FILE"
+    fi
+    if [ -f "$WORKER_SUBTITLES_LOG_FILE" ]; then
+        files="$files $WORKER_SUBTITLES_LOG_FILE"
+    fi
+    if [ -f "$WORKER_SYNC_LOG_FILE" ]; then
+        files="$files $WORKER_SYNC_LOG_FILE"
     fi
 
     if [ -z "$files" ]; then
@@ -692,6 +824,16 @@ cmd_prewarm_run() {
     "$VENV_PYTHON" -m src.scripts.prewarm_cli run "$@"
 }
 
+cmd_new_video_scan() {
+    check_deps
+    "$VENV_PYTHON" -m src.scripts.new_video_scan "$@"
+}
+
+cmd_workflow_retry() {
+    check_deps
+    "$VENV_PYTHON" -m src.scripts.workflow_retry "$@"
+}
+
 cmd_help() {
     echo -e "${CYAN}VOD MVP Management Script${NC}"
     echo "========================="
@@ -715,6 +857,10 @@ cmd_help() {
     echo "                  Uso: ./vod.sh prewarm-plan --ranking-file <FILE> [--top N] [--limit N]"
     echo "  prewarm-run     Ejecuta el prewarming enviando candidatos COLD a vod_batch."
     echo "                  Uso: ./vod.sh prewarm-run --ranking-file <FILE> [--top N] [--limit N] [--dry-run]"
+    echo "  new-video-scan  Escanea nuevos videos en VOD_NEW_INGEST_ROOT con observación de estabilidad."
+    echo "                  Uso: ./vod.sh new-video-scan [--dry-run] [--root PATH] [--stable-seconds N]"
+    echo "  workflow-retry  Reintenta un paso fallido de post-procesamiento (AZURE_BACKUP, SUBTITLES, ENLACE_SYNC)."
+    echo "                  Uso: ./vod.sh workflow-retry <ASSET> <STEP_TYPE> [--force]"
     echo ""
     echo "Ejemplo completo:"
     echo "  cp /ruta/del/video/PREDI-MVIDA464.mp4 storage/input/"
@@ -765,6 +911,12 @@ case "$COMMAND" in
         ;;
     prewarm-run)
         cmd_prewarm_run "$@"
+        ;;
+    new-video-scan)
+        cmd_new_video_scan "$@"
+        ;;
+    workflow-retry)
+        cmd_workflow_retry "$@"
         ;;
     help|"")
         cmd_help

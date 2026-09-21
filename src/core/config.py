@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     VOD_PREWARM_ENQUEUE_LIMIT: int = 50
     VOD_BATCH_MAX_QUEUE_DEPTH: int = 50
 
+    # Phase 5 Settings (Automatic New Video Pipeline)
+    VOD_NEW_INGEST_ROOT: str = "./storage/new_input"
+    VOD_INGEST_STABLE_SECONDS: int = 30
+    VOD_SUBTITLE_LANGUAGES: str = "es,en"
+    VOD_BACKUP_STORAGE_DIR: str = "./storage/backup"
+
     @property
     def normalized_cdn_url(self) -> str:
         return self.CDN_BASE_URL.rstrip("/")

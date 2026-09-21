@@ -6,9 +6,25 @@ from src.core.config import settings
 
 QUEUE_LEGACY = "vod_tasks"
 QUEUE_PRIORITY = "vod_priority"
+QUEUE_INGEST = "vod_ingest"
 QUEUE_BATCH = "vod_batch"
 
-ALL_QUEUES = [QUEUE_PRIORITY, QUEUE_BATCH, QUEUE_LEGACY]
+# Post-processing queues
+QUEUE_BACKUP = "vod_backup"
+QUEUE_SUBTITLES = "vod_subtitles"
+QUEUE_SYNC = "vod_sync"
+
+TRANSCODE_QUEUES = [QUEUE_PRIORITY, QUEUE_INGEST, QUEUE_BATCH, QUEUE_LEGACY]
+POST_PROCESS_QUEUES = [QUEUE_BACKUP, QUEUE_SUBTITLES, QUEUE_SYNC]
+ALL_QUEUES = [
+    QUEUE_PRIORITY,
+    QUEUE_INGEST,
+    QUEUE_BATCH,
+    QUEUE_LEGACY,
+    QUEUE_BACKUP,
+    QUEUE_SUBTITLES,
+    QUEUE_SYNC,
+]
 
 def get_redis_connection(url: Optional[str] = None) -> Redis:
     redis_url = url or settings.REDIS_URL
@@ -20,11 +36,7 @@ def get_queue(queue_name: str, connection: Optional[Redis] = None) -> Queue:
 
 def get_all_queues(connection: Optional[Redis] = None) -> dict[str, Queue]:
     conn = connection or get_redis_connection()
-    return {
-        QUEUE_LEGACY: Queue(name=QUEUE_LEGACY, connection=conn),
-        QUEUE_PRIORITY: Queue(name=QUEUE_PRIORITY, connection=conn),
-        QUEUE_BATCH: Queue(name=QUEUE_BATCH, connection=conn),
-    }
+    return {q_name: Queue(name=q_name, connection=conn) for q_name in ALL_QUEUES}
 
 def get_queue_depths(connection: Optional[Redis] = None) -> dict[str, int]:
     queues = get_all_queues(connection)

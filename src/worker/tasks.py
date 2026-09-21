@@ -20,9 +20,11 @@ from src.worker.archive import archive_source_file
 from src.models.asset import Asset
 from src.models.job import Job
 from src.models.rendition import Rendition
+from src.models.ingest_item import IngestItem
 from src.models.enums import VideoStatus, JobStatus, JobType
 from src.worker.transcode import execute_transcode, TranscodeError, get_selected_variants, LADDER
 from src.worker.validation import validate_hls_output
+from src.services.workflow.orchestrator import schedule_post_ready_work
 
 logger = logging.getLogger(__name__)
 
@@ -734,12 +736,19 @@ def progressive_transcode_asset_job(job_id: UUID):
                 job.finished_at = datetime.now(timezone.utc)
                 db.commit()
 
-                try:
-                    archive_source_file(db, asset)
-                    db.commit()
-                except Exception as e:
-                    db.rollback()
-                    logger.exception("Failed to archive source file, but asset is already READY")
+                is_new_video_pipeline = db.query(IngestItem).filter(IngestItem.asset_id == asset.id).first() is not None
+                if is_new_video_pipeline:
+                    try:
+                        schedule_post_ready_work(asset, db)
+                    except Exception as e:
+                        logger.exception(f"Failed to schedule post-ready work for asset {asset.vod_uuid}: {e}")
+                else:
+                    try:
+                        archive_source_file(db, asset)
+                        db.commit()
+                    except Exception as e:
+                        db.rollback()
+                        logger.exception("Failed to archive source file, but asset is already READY")
 
             except TranscodeError as e:
                 db.rollback()

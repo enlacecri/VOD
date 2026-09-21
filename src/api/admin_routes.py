@@ -84,11 +84,27 @@ def _calculate_metrics(asset: Asset) -> dict:
 
 @router.get("/dashboard")
 def dashboard(db: Session = Depends(get_db)):
-    from src.core.queues import QUEUE_LEGACY, QUEUE_PRIORITY, QUEUE_BATCH
+    from src.core.queues import (
+        QUEUE_LEGACY,
+        QUEUE_PRIORITY,
+        QUEUE_INGEST,
+        QUEUE_BATCH,
+        QUEUE_BACKUP,
+        QUEUE_SUBTITLES,
+        QUEUE_SYNC,
+    )
+    from src.models.ingest_item import IngestItem
+    from src.models.workflow_step import AssetWorkflowStep
+    from src.models.enums import IngestStatus, WorkflowStepType, WorkflowStepStatus
+
     redis_conn = Redis.from_url(settings.REDIS_URL)
     legacy_q = Queue(name=QUEUE_LEGACY, connection=redis_conn)
     priority_q = Queue(name=QUEUE_PRIORITY, connection=redis_conn)
+    ingest_q = Queue(name=QUEUE_INGEST, connection=redis_conn)
     batch_q = Queue(name=QUEUE_BATCH, connection=redis_conn)
+    backup_q = Queue(name=QUEUE_BACKUP, connection=redis_conn)
+    subtitles_q = Queue(name=QUEUE_SUBTITLES, connection=redis_conn)
+    sync_q = Queue(name=QUEUE_SYNC, connection=redis_conn)
 
     workers = Worker.all(connection=redis_conn)
     stale_before = datetime.now(timezone.utc) - timedelta(
@@ -103,7 +119,63 @@ def dashboard(db: Session = Depends(get_db)):
         Asset.status == VideoStatus.FAILED
     ).order_by(Asset.updated_at.desc()).limit(10).all()
 
-    total_depth = legacy_q.count + priority_q.count + batch_q.count
+    total_depth = (
+        legacy_q.count
+        + priority_q.count
+        + ingest_q.count
+        + batch_q.count
+        + backup_q.count
+        + subtitles_q.count
+        + sync_q.count
+    )
+
+    # Ingest Item metrics
+    ingest_waiting_stable = db.query(func.count(IngestItem.id)).filter(
+        IngestItem.status == IngestStatus.WAITING_STABLE
+    ).scalar() or 0
+
+    ingest_metadata_pending = db.query(func.count(IngestItem.id)).filter(
+        IngestItem.status == IngestStatus.METADATA_PENDING
+    ).scalar() or 0
+
+    new_ingest_pending = db.query(func.count(IngestItem.id)).filter(
+        IngestItem.status.in_([IngestStatus.WAITING_STABLE, IngestStatus.METADATA_PENDING, IngestStatus.REGISTERED])
+    ).scalar() or 0
+
+    new_ingest_failed = db.query(func.count(IngestItem.id)).filter(
+        IngestItem.status.in_([IngestStatus.FAILED, IngestStatus.CONFLICT, IngestStatus.SOURCE_CHANGED])
+    ).scalar() or 0
+
+    # Workflow step metrics
+    backup_pending = db.query(func.count(AssetWorkflowStep.id)).filter(
+        AssetWorkflowStep.step_type == WorkflowStepType.AZURE_BACKUP,
+        AssetWorkflowStep.status.in_([WorkflowStepStatus.PENDING, WorkflowStepStatus.QUEUED, WorkflowStepStatus.PROCESSING])
+    ).scalar() or 0
+
+    backup_failed = db.query(func.count(AssetWorkflowStep.id)).filter(
+        AssetWorkflowStep.step_type == WorkflowStepType.AZURE_BACKUP,
+        AssetWorkflowStep.status == WorkflowStepStatus.FAILED
+    ).scalar() or 0
+
+    subtitles_pending = db.query(func.count(AssetWorkflowStep.id)).filter(
+        AssetWorkflowStep.step_type == WorkflowStepType.SUBTITLES,
+        AssetWorkflowStep.status.in_([WorkflowStepStatus.PENDING, WorkflowStepStatus.QUEUED, WorkflowStepStatus.PROCESSING])
+    ).scalar() or 0
+
+    subtitles_failed = db.query(func.count(AssetWorkflowStep.id)).filter(
+        AssetWorkflowStep.step_type == WorkflowStepType.SUBTITLES,
+        AssetWorkflowStep.status == WorkflowStepStatus.FAILED
+    ).scalar() or 0
+
+    sync_pending = db.query(func.count(AssetWorkflowStep.id)).filter(
+        AssetWorkflowStep.step_type == WorkflowStepType.ENLACE_SYNC,
+        AssetWorkflowStep.status.in_([WorkflowStepStatus.PENDING, WorkflowStepStatus.QUEUED, WorkflowStepStatus.PROCESSING])
+    ).scalar() or 0
+
+    sync_failed = db.query(func.count(AssetWorkflowStep.id)).filter(
+        AssetWorkflowStep.step_type == WorkflowStepType.ENLACE_SYNC,
+        AssetWorkflowStep.status == WorkflowStepStatus.FAILED
+    ).scalar() or 0
 
     return {
         "generated_at": datetime.now(timezone.utc),
@@ -114,11 +186,37 @@ def dashboard(db: Session = Depends(get_db)):
             "depth": legacy_q.count,
             "legacy_queue_depth": legacy_q.count,
             "priority_queue_depth": priority_q.count,
+            "ingest_queue_depth": ingest_q.count,
             "batch_queue_depth": batch_q.count,
+            "backup_queue_depth": backup_q.count,
+            "subtitles_queue_depth": subtitles_q.count,
+            "sync_queue_depth": sync_q.count,
             "total_queue_depth": total_depth,
             "workers": len(workers),
             "stale_jobs": stale_jobs,
         },
+        "workflow": {
+            "new_ingest_pending": new_ingest_pending,
+            "new_ingest_failed": new_ingest_failed,
+            "ingest_waiting_stable": ingest_waiting_stable,
+            "ingest_metadata_pending": ingest_metadata_pending,
+            "backup_pending": backup_pending,
+            "backup_failed": backup_failed,
+            "subtitles_pending": subtitles_pending,
+            "subtitles_failed": subtitles_failed,
+            "sync_pending": sync_pending,
+            "sync_failed": sync_failed,
+        },
+        "new_ingest_pending": new_ingest_pending,
+        "new_ingest_failed": new_ingest_failed,
+        "ingest_waiting_stable": ingest_waiting_stable,
+        "ingest_metadata_pending": ingest_metadata_pending,
+        "backup_pending": backup_pending,
+        "backup_failed": backup_failed,
+        "subtitles_pending": subtitles_pending,
+        "subtitles_failed": subtitles_failed,
+        "sync_pending": sync_pending,
+        "sync_failed": sync_failed,
         "recent_failures": [
             {
                 "vod_uuid": asset.vod_uuid,

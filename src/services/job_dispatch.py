@@ -14,6 +14,7 @@ from src.core.config import settings
 from src.core.queues import (
     QUEUE_LEGACY,
     QUEUE_PRIORITY,
+    QUEUE_INGEST,
     QUEUE_BATCH,
     get_redis_connection,
     get_queue,
@@ -55,7 +56,7 @@ def dispatch_progressive_job(
     If Redis fails after step 3, Job is marked FAILED or left for reconciler,
     ensuring workers never read uncommitted database state.
     """
-    if queue_name not in (QUEUE_PRIORITY, QUEUE_BATCH, QUEUE_LEGACY):
+    if queue_name not in (QUEUE_PRIORITY, QUEUE_INGEST, QUEUE_BATCH, QUEUE_LEGACY):
         raise ValueError(f"Invalid queue name: {queue_name}")
 
     if asset.status == VideoStatus.FAILED:
@@ -121,26 +122,28 @@ def dispatch_progressive_job(
             db.commit()
         raise QueueUnavailableError(f"Failed to enqueue job to Redis: {e}")
 
-def promote_batch_to_priority(
+def promote_pending_job_to_priority(
     active_job: Job,
     asset: Asset,
     db: Session,
     redis_conn: Optional[Redis] = None
 ) -> dict:
     """
-    Safely promotes a PENDING batch transcode job to vod_priority.
+    Safely promotes a PENDING transcode job (from vod_batch or vod_ingest) to vod_priority.
     Evaluates the real RQ state to protect against concurrency races:
       - If already PROCESSING in DB or STARTED in RQ: do NOT promote, reuse processing.
-      - If QUEUED in vod_batch: remove from batch queue and promote to priority.
+      - If QUEUED in source queue: remove from source queue and promote to priority.
       - If removal returns 0: re-check status (worker may have just started).
     Maintains the exact same PostgreSQL Job record (active_job.id).
     """
+    source_queue = active_job.queue_name or QUEUE_BATCH
+
     # 1. Check DB state
     if active_job.status == JobStatus.PROCESSING:
         return {
             "action": "REUSE_PROCESSING",
             "job": active_job,
-            "detail": "Batch job is already PROCESSING, reusing ongoing transcode."
+            "detail": f"Job in {source_queue} is already PROCESSING, reusing ongoing transcode."
         }
 
     if active_job.status != JobStatus.PENDING:
@@ -165,12 +168,12 @@ def promote_batch_to_priority(
         rq_job = RQJob.fetch(target_rq_id, connection=conn)
     except NoSuchJobError:
         # Check if the job might already be running in StartedJobRegistry of any queue
-        q_batch = get_queue(QUEUE_BATCH, connection=conn)
+        q_src = get_queue(source_queue, connection=conn)
         q_prio = get_queue(QUEUE_PRIORITY, connection=conn)
         in_started = (
-            target_rq_id in q_batch.started_job_registry.get_job_ids() or
+            target_rq_id in q_src.started_job_registry.get_job_ids() or
             target_rq_id in q_prio.started_job_registry.get_job_ids() or
-            str(active_job.id) in q_batch.started_job_registry.get_job_ids() or
+            str(active_job.id) in q_src.started_job_registry.get_job_ids() or
             str(active_job.id) in q_prio.started_job_registry.get_job_ids()
         )
         if in_started:
@@ -208,15 +211,15 @@ def promote_batch_to_priority(
 
     rq_status = rq_job.get_status()
 
-    # Case C: Worker already started executing the batch job
+    # Case C: Worker already started executing the job
     if rq_status == RQJobStatus.STARTED or rq_status == "started":
-        logger.info(f"Promotion: Job {active_job.id} already STARTED by batch worker. Reusing.")
+        logger.info(f"Promotion: Job {active_job.id} already STARTED by worker on {source_queue}. Reusing.")
         active_job.status = JobStatus.PROCESSING
         db.commit()
         return {
             "action": "REUSE_STARTED",
             "job": active_job,
-            "detail": "Batch worker already started execution, reusing ongoing transcode."
+            "detail": f"Worker on {source_queue} already started execution, reusing ongoing transcode."
         }
 
     # Case D: Already finished
@@ -235,31 +238,33 @@ def promote_batch_to_priority(
             "detail": f"RQ job is {rq_status}, cannot promote."
         }
 
-    # Case A: RQ job is QUEUED in vod_batch
-    q_batch = get_queue(QUEUE_BATCH, connection=conn)
-    removed_count = q_batch.remove(rq_job.id)
+    # Case A: RQ job is QUEUED in source queue
+    q_src = get_queue(source_queue, connection=conn)
+    removed_count = q_src.remove(rq_job.id)
 
     if removed_count == 1:
-        # Successfully removed from batch queue before any worker could pop it
+        # Successfully removed from source queue before worker could pop it
         q_prio = get_queue(QUEUE_PRIORITY, connection=conn)
         rq_job.origin = QUEUE_PRIORITY
         rq_job.save()
         q_prio.enqueue_job(rq_job)
 
+        old_queue = active_job.queue_name
         active_job.queue_name = QUEUE_PRIORITY
+        context_str = "batch_to_priority_promotion" if old_queue == QUEUE_BATCH else f"{old_queue}_to_priority_promotion"
         db.add(AssetEvent(
             asset_id=asset.id,
             event_type=EventType.TRANSITION,
             details={
                 "job_id": str(active_job.id),
-                "old_queue": QUEUE_BATCH,
+                "old_queue": old_queue,
                 "new_queue": QUEUE_PRIORITY,
-                "context": "batch_to_priority_promotion"
+                "context": context_str
             }
         ))
         db.commit()
         db.refresh(active_job)
-        logger.info(f"Job {active_job.id} successfully PROMOTED from {QUEUE_BATCH} to {QUEUE_PRIORITY}.")
+        logger.info(f"Job {active_job.id} successfully PROMOTED from {old_queue} to {QUEUE_PRIORITY}.")
         return {
             "action": "PROMOTED",
             "job": active_job,
@@ -280,15 +285,17 @@ def promote_batch_to_priority(
             return {
                 "action": "REUSE_STARTED",
                 "job": active_job,
-                "detail": "Batch worker popped job during promotion attempt, reusing."
+                "detail": f"Worker on {source_queue} popped job during promotion attempt, reusing."
             }
         else:
-            logger.warning(f"Promotion: could not remove from batch queue (status: {new_status}).")
+            logger.warning(f"Promotion: could not remove from {source_queue} (status: {new_status}).")
             return {
                 "action": "REMOVE_FAILED",
                 "job": active_job,
-                "detail": f"Could not remove from batch queue (status: {new_status})."
+                "detail": f"Could not remove from {source_queue} (status: {new_status})."
             }
+
+promote_batch_to_priority = promote_pending_job_to_priority
 
 def batch_enqueue_asset(
     asset_identifier: Union[str, uuid.UUID],
