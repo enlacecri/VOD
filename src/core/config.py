@@ -2,8 +2,13 @@ from pydantic_settings import BaseSettings
 from typing import Optional
 
 class Settings(BaseSettings):
-    DATABASE_URL: str = "postgresql+psycopg://vod_user:vod_password@localhost:5433/vod_db"
-    REDIS_URL: str = "redis://localhost:6379/0"
+    VOD_POSTGRES_PORT: int = 5434
+    VOD_REDIS_PORT: int = 6380
+    VOD_NGINX_PORT: int = 8085
+    VOD_API_PORT: int = 8005
+
+    DATABASE_URL: str = "postgresql+psycopg://vod_user:vod_password@localhost:5434/vod_db"
+    REDIS_URL: str = "redis://localhost:6380/0"
     
     INGEST_ROOT: str = "./storage/input"
     STAGING_ROOT: str = "./storage/staging"
@@ -42,7 +47,7 @@ class Settings(BaseSettings):
     TRANSCODE_CONCURRENCY: int = 1
     
     CDN_BASE_URL: str = "https://videocdn.enlace.plus"
-    HLS_PLAYBACK_BASE_URL: str = "http://localhost:8080"
+    HLS_PLAYBACK_BASE_URL: str = "http://localhost:8085"
     HLS_VALIDATION_TIMEOUT_SECONDS: int = 300
     
     # Tolerances and Intervals

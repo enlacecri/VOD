@@ -24,12 +24,16 @@ WORKER_LOG_FILE="$LOGS_DIR/worker.log"
 
 ALLOWED_EXTENSIONS=(".mp4" ".mov" ".mkv" ".mxf" ".avi" ".m4v")
 
-# Extraer INGEST_ROOT del .env o default
+# Extraer INGEST_ROOT, VOD_API_PORT y VOD_NGINX_PORT del .env o default
 if [ -f .env ]; then
     INGEST_ROOT=$(grep -E "^INGEST_ROOT=" .env | cut -d '=' -f2 | tr -d '"' | tr -d "'")
+    VOD_API_PORT=$(grep -E "^VOD_API_PORT=" .env | cut -d '=' -f2 | tr -d '"' | tr -d "'")
+    VOD_NGINX_PORT=$(grep -E "^VOD_NGINX_PORT=" .env | cut -d '=' -f2 | tr -d '"' | tr -d "'")
 fi
 INGEST_ROOT=${INGEST_ROOT:-storage/input}
 INGEST_ROOT=$(echo "$INGEST_ROOT" | sed 's/^\.\///') # Limpiar ./ inicial si existe
+VOD_API_PORT=${VOD_API_PORT:-8005}
+VOD_NGINX_PORT=${VOD_NGINX_PORT:-8085}
 
 # ==============================================================================
 # Funciones Auxiliares
@@ -190,7 +194,7 @@ cmd_start() {
         warning "La API ya estaba iniciada (PID: $(cat $API_PID_FILE))."
     else
         echo -n "Iniciando API... "
-        uvicorn src.main:app --host 0.0.0.0 --port 8000 > "$API_LOG_FILE" 2>&1 &
+        uvicorn src.main:app --host 0.0.0.0 --port "$VOD_API_PORT" > "$API_LOG_FILE" 2>&1 &
         echo $! > "$API_PID_FILE"
         api_started_this_run=1
         success "API iniciada (PID: $(cat $API_PID_FILE))"
@@ -226,8 +230,8 @@ EOF
 )
 
     for ((i=1; i<=max_retries; i++)); do
-        local live_resp=$(curl -s http://localhost:8000/health/live || echo "{}")
-        local ready_resp=$(curl -s http://localhost:8000/health/ready || echo "{}")
+        local live_resp=$(curl -s "http://localhost:${VOD_API_PORT}/health/live" || echo "{}")
+        local ready_resp=$(curl -s "http://localhost:${VOD_API_PORT}/health/ready" || echo "{}")
         if "$VENV_PYTHON" -c "$health_script" "$live_resp" "$ready_resp" 2>/dev/null; then
             health_ok=1
             break
@@ -291,9 +295,9 @@ EOF
     success "==========================================================="
     success " Sistema VOD inicializado correctamente."
     success "==========================================================="
-    echo -e "API Base:    ${CYAN}http://localhost:8000${NC}"
-    echo -e "Swagger UI:  ${CYAN}http://localhost:8000/docs${NC}"
-    echo -e "Nginx / HLS: ${CYAN}http://localhost:8080${NC}"
+    echo -e "API Base:    ${CYAN}http://localhost:${VOD_API_PORT}${NC}"
+    echo -e "Swagger UI:  ${CYAN}http://localhost:${VOD_API_PORT}/docs${NC}"
+    echo -e "Nginx / HLS: ${CYAN}http://localhost:${VOD_NGINX_PORT}${NC}"
     echo ""
     cmd_status
 }
@@ -336,8 +340,8 @@ cmd_status() {
     fi
 
     echo -e "\n${CYAN}--- HEALTHCHECKS ---${NC}"
-    local live_http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health/live || echo "000")
-    local ready_http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health/ready || echo "000")
+    local live_http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${VOD_API_PORT}/health/live" || echo "000")
+    local ready_http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${VOD_API_PORT}/health/ready" || echo "000")
 
     if [ "$live_http_code" = "200" ]; then
         echo -e "Live:   ${GREEN}OK${NC}"
@@ -504,7 +508,7 @@ EOF
         return 1
     fi
 
-    local live_http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health/live || echo "000")
+    local live_http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${VOD_API_PORT}/health/live" || echo "000")
     if [ "$live_http_code" != "200" ]; then
         error "La API no está lista. Asegúrese de ejecutar './vod.sh start' primero."
         return 1
@@ -521,7 +525,7 @@ EOF
     local json_payload
     json_payload=$("$VENV_PYTHON" -c "$payload_script" "$derived_id" "$source_uri")
 
-    local response=$(curl -s -w "\n%{http_code}" -X POST "http://localhost:8000/api/v1/assets" \
+    local response=$(curl -s -w "\n%{http_code}" -X POST "http://localhost:${VOD_API_PORT}/api/v1/assets" \
          -H "Content-Type: application/json" \
          -d "$json_payload")
 
@@ -567,7 +571,7 @@ cmd_ingest() {
 cmd_ingest_all() {
     check_deps
     
-    local live_http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health/live || echo "000")
+    local live_http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${VOD_API_PORT}/health/live" || echo "000")
     if [ "$live_http_code" != "200" ]; then
         die "La API no está lista. Asegúrese de ejecutar './vod.sh start' primero."
     fi

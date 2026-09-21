@@ -24,7 +24,7 @@ from sqlalchemy.orm import sessionmaker
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 # Setup test database
-SQLALCHEMY_DATABASE_URL = settings.DATABASE_URL.replace("5433/vod", "5433/vod_test")
+SQLALCHEMY_DATABASE_URL = settings.DATABASE_URL.rsplit("/", 1)[0] + "/vod_test"
 from sqlalchemy.pool import NullPool
 engine = create_engine(SQLALCHEMY_DATABASE_URL, poolclass=NullPool)
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

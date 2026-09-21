@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: vod_password
       POSTGRES_DB: vod_db
     ports:
-      - "5433:5432"
+      - "${VOD_POSTGRES_PORT:-5434}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -23,7 +23,7 @@ services:
     # Habilitar persistencia en Redis (AOF y RDB)
     command: redis-server --appendonly yes
     ports:
-      - "6379:6379"
+      - "${VOD_REDIS_PORT:-6380}:6379"
     volumes:
       - redis_data:/data
     restart: unless-stopped
@@ -37,7 +37,7 @@ services:
     image: nginx:alpine
     container_name: vod-nginx
     ports:
-      - "8080:80"
+      - "${VOD_NGINX_PORT:-8085}:80"
     volumes:
       - ./storage/output:/usr/share/nginx/html:ro
       - ./storage/progressive:/storage_progressive:ro

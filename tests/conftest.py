@@ -7,7 +7,7 @@ from sqlalchemy.pool import NullPool
 from src.core.config import settings
 from src.core.database import Base
 
-SQLALCHEMY_DATABASE_URL = settings.DATABASE_URL.replace("5433/vod", "5433/vod_test")
+SQLALCHEMY_DATABASE_URL = settings.DATABASE_URL.rsplit("/", 1)[0] + "/vod_test"
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
