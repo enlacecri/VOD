@@ -83,6 +83,50 @@ class ProgressiveSession:
             pass
 
 
+def parse_variant_playlist(playlist_path: Path) -> tuple[int, float, List[str]]:
+    """
+    Parses an HLS variant playlist to extract:
+    - segment count
+    - total accumulated duration
+    - list of segment file names
+    Verifies that each segment file exists, is regular file, not a symlink, and is not empty.
+    """
+    if not playlist_path.exists():
+        return 0, 0.0, []
+
+    try:
+        content = playlist_path.read_text()
+    except Exception:
+        return 0, 0.0, []
+
+    lines = content.splitlines()
+    segments = []
+    durations = []
+    current_duration = 0.0
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#EXTINF:"):
+            match = EXTINF_RE.match(line)
+            if match:
+                try:
+                    current_duration = float(match.group(1))
+                except ValueError:
+                    current_duration = 0.0
+        elif not line.startswith("#"):
+            seg_name = line
+            seg_path = playlist_path.parent / seg_name
+            # Only count segment if it physically exists on disk and is non-empty
+            if seg_path.exists() and seg_path.is_file() and not seg_path.is_symlink() and seg_path.stat().st_size > 0:
+                segments.append(seg_name)
+                durations.append(current_duration)
+            current_duration = 0.0
+
+    return len(segments), sum(durations), segments
+
+
 class ProgressiveSessionManager:
     def __init__(self):
         self._sessions: Dict[str, ProgressiveSession] = {}
@@ -117,48 +161,8 @@ class ProgressiveSessionManager:
 
         return session
 
-    def _parse_variant_playlist(self, playlist_path: Path) -> (int, float, List[str]):
-        """
-        Parses an HLS variant playlist to extract:
-        - segment count
-        - total accumulated duration
-        - list of segment file names
-        Verifies that each segment file exists and is not empty.
-        """
-        if not playlist_path.exists():
-            return 0, 0.0, []
-
-        try:
-            content = playlist_path.read_text()
-        except Exception:
-            return 0, 0.0, []
-
-        lines = content.splitlines()
-        segments = []
-        durations = []
-        current_duration = 0.0
-
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith("#EXTINF:"):
-                match = EXTINF_RE.match(line)
-                if match:
-                    try:
-                        current_duration = float(match.group(1))
-                    except ValueError:
-                        current_duration = 0.0
-            elif not line.startswith("#"):
-                seg_name = line
-                seg_path = playlist_path.parent / seg_name
-                # Only count segment if it physically exists on disk and is non-empty
-                if seg_path.exists() and seg_path.is_file() and seg_path.stat().st_size > 0:
-                    segments.append(seg_name)
-                    durations.append(current_duration)
-                current_duration = 0.0
-
-        return len(segments), sum(durations), segments
+    def _parse_variant_playlist(self, playlist_path: Path) -> tuple[int, float, List[str]]:
+        return parse_variant_playlist(playlist_path)
 
     def _run_transcode_session(self, session: ProgressiveSession):
         session_dir = session.session_dir

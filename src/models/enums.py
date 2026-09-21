@@ -1,13 +1,24 @@
 import enum
 
 class VideoStatus(str, enum.Enum):
+    COLD = "cold"
     CREATED = "created"
     PROBING = "probing"
     QUEUED = "queued"
     PROCESSING = "processing"
+    PLAYABLE = "playable"
     VALIDATING = "validating"
     READY = "ready"
     FAILED = "failed"
+
+    @classmethod
+    def _missing_(cls, value):
+        if isinstance(value, str):
+            val_lower = value.lower()
+            for member in cls:
+                if member.value == val_lower or member.name.lower() == val_lower:
+                    return member
+        return None
 
 class EventType(str, enum.Enum):
     TRANSITION = "TRANSITION"

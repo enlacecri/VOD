@@ -33,6 +33,7 @@ class Asset(Base):
     error_message = Column(String, nullable=True)
     
     duration_seconds = Column(Float, nullable=True)
+    available_until_seconds = Column(Float, nullable=True)
     source_width = Column(Integer, nullable=True)
     source_height = Column(Integer, nullable=True)
     source_fps = Column(Float, nullable=True)
@@ -47,6 +48,10 @@ class Asset(Base):
     jobs = relationship("Job", back_populates="asset", cascade="all, delete-orphan")
     renditions = relationship("Rendition", back_populates="asset", cascade="all, delete-orphan")
     events = relationship("AssetEvent", back_populates="asset", cascade="all, delete-orphan")
+
+    @property
+    def playable(self) -> bool:
+        return self.status in (VideoStatus.PLAYABLE, VideoStatus.VALIDATING, VideoStatus.READY)
 
     __table_args__ = (
         CheckConstraint('progress >= 0 AND progress <= 100', name='chk_asset_progress'),
