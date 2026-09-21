@@ -361,8 +361,8 @@ def prepare_playback(vod_uuid: uuid.UUID, db: Session = Depends(get_db)):
             error_message=None
         )
 
-    # 4. Check if already QUEUED or PROCESSING with active job
-    if asset.status in (VideoStatus.QUEUED, VideoStatus.PROCESSING):
+    # 4. Check if already CREATED, PROBING, QUEUED or PROCESSING with active job
+    if asset.status in (VideoStatus.CREATED, VideoStatus.PROBING, VideoStatus.QUEUED, VideoStatus.PROCESSING):
         active_job = db.query(Job).filter(
             Job.asset_id == asset.id,
             Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING])
@@ -385,7 +385,20 @@ def prepare_playback(vod_uuid: uuid.UUID, db: Session = Depends(get_db)):
                 error_message=None
             )
 
-    # 5. Asset is in COLD, CREATED, or FAILED: transition to QUEUED and dispatch to vod_priority
+    # 5. Check if FAILED: cannot be re-enqueued via prepare-playback; requires explicit retry
+    if asset.status == VideoStatus.FAILED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error_code": "REQUIRES_EXPLICIT_RETRY",
+                "status": "FAILED",
+                "vod_uuid": str(asset.vod_uuid),
+                "enlace_id": asset.enlace_id,
+                "message": "Asset is in FAILED state. Requires explicit retry via /api/v1/assets/{vod_uuid}/retry."
+            }
+        )
+
+    # 6. Asset is COLD (or CREATED without active job): transition to QUEUED and dispatch to vod_priority
     from src.services.job_dispatch import dispatch_progressive_job, QueueUnavailableError
     from src.core.queues import QUEUE_PRIORITY
     try:
@@ -398,7 +411,7 @@ def prepare_playback(vod_uuid: uuid.UUID, db: Session = Depends(get_db)):
     except QueueUnavailableError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"error_code": "E_QUEUE_UNAVAILABLE", "message": "Failed to enqueue job"}
+            detail={"error_code": "E_QUEUE_UNAVAILABLE", "message": "Failed to enqueue job to Redis. Job remains PENDING in DB for reconciliation."}
         )
 
     return PreparePlaybackResponse(

@@ -226,12 +226,20 @@ def reconcile_jobs():
         # Query Redis outside transaction
         redis_status = None
         rq_job = None
+        rq_id_candidate = job_rq_id or str(current_job_id)
         try:
-            rq_job = RQJob.fetch(str(current_job_id), connection=redis_conn)
+            rq_job = RQJob.fetch(str(rq_id_candidate), connection=redis_conn)
             redis_status = rq_job.get_status()
         except NoSuchJobError:
-            redis_status = 'missing'
-            
+            if job_rq_id and str(job_rq_id) != str(current_job_id):
+                try:
+                    rq_job = RQJob.fetch(str(current_job_id), connection=redis_conn)
+                    redis_status = rq_job.get_status()
+                except NoSuchJobError:
+                    redis_status = 'missing'
+            else:
+                redis_status = 'missing'
+
         # Re-open transaction to apply changes
         db = SessionLocal()
         try:
@@ -239,10 +247,24 @@ def reconcile_jobs():
             job = db.query(Job).filter(Job.id == current_job_id).with_for_update().first()
             if not job or job.status != job_status_db:
                 continue # Changed concurrently
-                
+
             asset = db.query(Asset).filter(Asset.id == asset_id).first()
-            
+
             if redis_status == 'missing':
+                # Verification across all queues and registries
+                from src.core.queues import ALL_QUEUES
+                in_flight_redis = False
+                for qname in ALL_QUEUES:
+                    chk_q = Queue(name=qname, connection=redis_conn)
+                    chk_ids = set(chk_q.get_job_ids()) | set(chk_q.started_job_registry.get_job_ids())
+                    if str(current_job_id) in chk_ids or (job_rq_id and str(job_rq_id) in chk_ids):
+                        in_flight_redis = True
+                        logger.info(f"Job {current_job_id} found in queue/registry of '{qname}'. Not re-enqueueing.")
+                        break
+
+                if in_flight_redis:
+                    continue
+
                 logger.warning(f"Job {job.id} not found in Redis.")
                 if job.status == JobStatus.PENDING:
                     target_queue = job.queue_name if getattr(job, "queue_name", None) else settings.RQ_QUEUE_NAME
