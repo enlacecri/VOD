@@ -16,6 +16,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 RUN_DIR="storage/run"
+LOCK_DIR="$RUN_DIR/vod.lock"
 LOGS_DIR="storage/logs/services"
 API_PID_FILE="$RUN_DIR/api.pid"
 WORKER_PID_FILE="$RUN_DIR/worker.pid"
@@ -59,6 +60,53 @@ success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; }
 die() { error "$1"; exit 1; }
+
+acquire_lock() {
+    local max_wait=15
+    local waited=0
+    mkdir -p "$RUN_DIR"
+
+    # Si ya tenemos el lock en este mismo proceso ($$)
+    if [ -f "$LOCK_DIR/pid" ] && [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then
+        return 0
+    fi
+
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        if [ -f "$LOCK_DIR/pid" ]; then
+            local lock_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+            if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+                warning "Detectado lock obsoleto (PID: $lock_pid). Limpiando lock..."
+                rm -rf "$LOCK_DIR"
+                continue
+            fi
+        fi
+        if [ $waited -ge $max_wait ]; then
+            die "No se pudo adquirir el lock ($LOCK_DIR). Otra instancia de vod.sh está ejecutándose (PID: $(cat "$LOCK_DIR/pid" 2>/dev/null))."
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    echo $$ > "$LOCK_DIR/pid"
+    trap 'release_lock' EXIT INT TERM
+}
+
+release_lock() {
+    if [ -d "$LOCK_DIR" ]; then
+        local lock_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+        if [ "$lock_pid" = "$$" ] || [ -z "$lock_pid" ]; then
+            rm -rf "$LOCK_DIR"
+        fi
+    fi
+}
+
+check_or_reconcile_worker() {
+    local worker_name=$1
+    if [ -f "src/scripts/worker_manager.py" ]; then
+        "$VENV_PYTHON" src/scripts/worker_manager.py check-worker --name "$worker_name" 2>/dev/null
+    else
+        echo "STOPPED"
+    fi
+}
 
 check_deps() {
     # Check docker & docker compose
@@ -178,6 +226,7 @@ wait_for_db_redis() {
 # Comandos principales
 # ==============================================================================
 cmd_start() {
+    acquire_lock
     check_deps
     
     mkdir -p "$RUN_DIR" "$LOGS_DIR" "$INGEST_ROOT" "$VOD_NEW_INGEST_ROOT"
@@ -198,6 +247,7 @@ cmd_start() {
     
     info "Esperando disponibilidad de PostgreSQL y Redis..."
     if ! wait_for_db_redis; then
+        release_lock
         die "Tiempo de espera agotado para DB/Redis."
     fi
     success "Bases de datos listas."
@@ -208,6 +258,7 @@ cmd_start() {
         success "Migraciones completadas"
     else
         echo -e "${RED}[ERROR]${NC} Fallaron las migraciones."
+        release_lock
         return 1
     fi
 
@@ -223,76 +274,137 @@ cmd_start() {
     fi
 
     # --- Transcode Workers ---
-    if check_pid_running "$WORKER_PID_FILE" "run_worker"; then
+    local legacy_status=$(check_or_reconcile_worker "vod-legacy-worker")
+    if [[ "$legacy_status" =~ ^RUNNING ]]; then
+        local existing_pid=$(echo "$legacy_status" | awk '{print $2}')
+        warning "El Legacy Worker ya estaba iniciado (PID: $existing_pid)."
+    elif [ ! -f "src/scripts/worker_manager.py" ] && check_pid_running "$WORKER_PID_FILE" "run_worker"; then
         warning "El Legacy Worker ya estaba iniciado (PID: $(cat $WORKER_PID_FILE))."
     else
         echo -n "Iniciando Legacy Worker (vod_tasks)... "
         "$VENV_PYTHON" src/scripts/run_worker.py --queue vod_tasks --name vod-legacy-worker > "$WORKER_LOG_FILE" 2>&1 &
-        echo $! > "$WORKER_PID_FILE"
-        worker_started_this_run=1
-        success "Legacy Worker iniciado (PID: $(cat $WORKER_PID_FILE))"
+        local pid=$!
+        echo $pid > "$WORKER_PID_FILE"
+        worker_started_this_run=$pid
+        success "Legacy Worker iniciado (PID: $pid)"
     fi
 
-    if check_pid_running "$WORKER_PRIORITY_PID_FILE" "run_worker"; then
+    local priority_status=$(check_or_reconcile_worker "vod-priority-worker")
+    if [[ "$priority_status" =~ ^RUNNING ]]; then
+        local existing_pid=$(echo "$priority_status" | awk '{print $2}')
+        warning "El Priority Worker ya estaba iniciado (PID: $existing_pid)."
+    elif [ ! -f "src/scripts/worker_manager.py" ] && check_pid_running "$WORKER_PRIORITY_PID_FILE" "run_worker"; then
         warning "El Priority Worker ya estaba iniciado (PID: $(cat $WORKER_PRIORITY_PID_FILE))."
     else
         echo -n "Iniciando Priority Worker (vod_priority)... "
         "$VENV_PYTHON" src/scripts/run_worker.py --queue vod_priority --name vod-priority-worker > "$WORKER_PRIORITY_LOG_FILE" 2>&1 &
-        echo $! > "$WORKER_PRIORITY_PID_FILE"
-        worker_priority_started_this_run=1
-        success "Priority Worker iniciado (PID: $(cat $WORKER_PRIORITY_PID_FILE))"
+        local pid=$!
+        echo $pid > "$WORKER_PRIORITY_PID_FILE"
+        worker_priority_started_this_run=$pid
+        success "Priority Worker iniciado (PID: $pid)"
     fi
 
-    if check_pid_running "$WORKER_INGEST_PID_FILE" "run_worker"; then
+    local ingest_status=$(check_or_reconcile_worker "vod-ingest-worker")
+    if [[ "$ingest_status" =~ ^RUNNING ]]; then
+        local existing_pid=$(echo "$ingest_status" | awk '{print $2}')
+        warning "El Ingest Worker ya estaba iniciado (PID: $existing_pid)."
+    elif [ ! -f "src/scripts/worker_manager.py" ] && check_pid_running "$WORKER_INGEST_PID_FILE" "run_worker"; then
         warning "El Ingest Worker ya estaba iniciado (PID: $(cat $WORKER_INGEST_PID_FILE))."
     else
         echo -n "Iniciando Ingest Worker (vod_ingest)... "
         "$VENV_PYTHON" src/scripts/run_worker.py --queue vod_ingest --name vod-ingest-worker > "$WORKER_INGEST_LOG_FILE" 2>&1 &
-        echo $! > "$WORKER_INGEST_PID_FILE"
-        worker_ingest_started_this_run=1
-        success "Ingest Worker iniciado (PID: $(cat $WORKER_INGEST_PID_FILE))"
+        local pid=$!
+        echo $pid > "$WORKER_INGEST_PID_FILE"
+        worker_ingest_started_this_run=$pid
+        success "Ingest Worker iniciado (PID: $pid)"
     fi
 
-    if check_pid_running "$WORKER_BATCH_PID_FILE" "run_worker"; then
+    local batch_status=$(check_or_reconcile_worker "vod-batch-worker")
+    if [[ "$batch_status" =~ ^RUNNING ]]; then
+        local existing_pid=$(echo "$batch_status" | awk '{print $2}')
+        warning "El Batch Worker ya estaba iniciado (PID: $existing_pid)."
+    elif [ ! -f "src/scripts/worker_manager.py" ] && check_pid_running "$WORKER_BATCH_PID_FILE" "run_worker"; then
         warning "El Batch Worker ya estaba iniciado (PID: $(cat $WORKER_BATCH_PID_FILE))."
     else
         echo -n "Iniciando Batch Worker (vod_batch)... "
         "$VENV_PYTHON" src/scripts/run_worker.py --queue vod_batch --name vod-batch-worker > "$WORKER_BATCH_LOG_FILE" 2>&1 &
-        echo $! > "$WORKER_BATCH_PID_FILE"
-        worker_batch_started_this_run=1
-        success "Batch Worker iniciado (PID: $(cat $WORKER_BATCH_PID_FILE))"
+        local pid=$!
+        echo $pid > "$WORKER_BATCH_PID_FILE"
+        worker_batch_started_this_run=$pid
+        success "Batch Worker iniciado (PID: $pid)"
     fi
 
     # --- Post-process Workers ---
-    if check_pid_running "$WORKER_BACKUP_PID_FILE" "run_worker"; then
+    local backup_status=$(check_or_reconcile_worker "vod-backup-worker")
+    if [[ "$backup_status" =~ ^RUNNING ]]; then
+        local existing_pid=$(echo "$backup_status" | awk '{print $2}')
+        warning "El Backup Worker ya estaba iniciado (PID: $existing_pid)."
+    elif [ ! -f "src/scripts/worker_manager.py" ] && check_pid_running "$WORKER_BACKUP_PID_FILE" "run_worker"; then
         warning "El Backup Worker ya estaba iniciado (PID: $(cat $WORKER_BACKUP_PID_FILE))."
     else
         echo -n "Iniciando Backup Worker (vod_backup)... "
         "$VENV_PYTHON" src/scripts/run_worker.py --queue vod_backup --name vod-backup-worker > "$WORKER_BACKUP_LOG_FILE" 2>&1 &
-        echo $! > "$WORKER_BACKUP_PID_FILE"
-        worker_backup_started_this_run=1
-        success "Backup Worker iniciado (PID: $(cat $WORKER_BACKUP_PID_FILE))"
+        local pid=$!
+        echo $pid > "$WORKER_BACKUP_PID_FILE"
+        worker_backup_started_this_run=$pid
+        success "Backup Worker iniciado (PID: $pid)"
     fi
 
-    if check_pid_running "$WORKER_SUBTITLES_PID_FILE" "run_worker"; then
+    local subtitles_status=$(check_or_reconcile_worker "vod-subtitles-worker")
+    if [[ "$subtitles_status" =~ ^RUNNING ]]; then
+        local existing_pid=$(echo "$subtitles_status" | awk '{print $2}')
+        warning "El Subtitles Worker ya estaba iniciado (PID: $existing_pid)."
+    elif [ ! -f "src/scripts/worker_manager.py" ] && check_pid_running "$WORKER_SUBTITLES_PID_FILE" "run_worker"; then
         warning "El Subtitles Worker ya estaba iniciado (PID: $(cat $WORKER_SUBTITLES_PID_FILE))."
     else
         echo -n "Iniciando Subtitles Worker (vod_subtitles)... "
         "$VENV_PYTHON" src/scripts/run_worker.py --queue vod_subtitles --name vod-subtitles-worker > "$WORKER_SUBTITLES_LOG_FILE" 2>&1 &
-        echo $! > "$WORKER_SUBTITLES_PID_FILE"
-        worker_subtitles_started_this_run=1
-        success "Subtitles Worker iniciado (PID: $(cat $WORKER_SUBTITLES_PID_FILE))"
+        local pid=$!
+        echo $pid > "$WORKER_SUBTITLES_PID_FILE"
+        worker_subtitles_started_this_run=$pid
+        success "Subtitles Worker iniciado (PID: $pid)"
     fi
 
-    if check_pid_running "$WORKER_SYNC_PID_FILE" "run_worker"; then
+    local sync_status=$(check_or_reconcile_worker "vod-sync-worker")
+    if [[ "$sync_status" =~ ^RUNNING ]]; then
+        local existing_pid=$(echo "$sync_status" | awk '{print $2}')
+        warning "El Sync Worker ya estaba iniciado (PID: $existing_pid)."
+    elif [ ! -f "src/scripts/worker_manager.py" ] && check_pid_running "$WORKER_SYNC_PID_FILE" "run_worker"; then
         warning "El Sync Worker ya estaba iniciado (PID: $(cat $WORKER_SYNC_PID_FILE))."
     else
         echo -n "Iniciando Sync Worker (vod_sync)... "
         "$VENV_PYTHON" src/scripts/run_worker.py --queue vod_sync --name vod-sync-worker > "$WORKER_SYNC_LOG_FILE" 2>&1 &
-        echo $! > "$WORKER_SYNC_PID_FILE"
-        worker_sync_started_this_run=1
-        success "Sync Worker iniciado (PID: $(cat $WORKER_SYNC_PID_FILE))"
+        local pid=$!
+        echo $pid > "$WORKER_SYNC_PID_FILE"
+        worker_sync_started_this_run=$pid
+        success "Sync Worker iniciado (PID: $pid)"
     fi
+
+    # Helper function for rollback of only newly started processes
+    rollback_started_workers() {
+        info "Iniciando Rollback de procesos..."
+        if [ "$api_started_this_run" -eq 1 ]; then
+            graceful_kill "$API_PID_FILE" "uvicorn"
+        fi
+        local pids_to_rollback=("$worker_started_this_run" "$worker_priority_started_this_run" "$worker_ingest_started_this_run" "$worker_batch_started_this_run" "$worker_backup_started_this_run" "$worker_subtitles_started_this_run" "$worker_sync_started_this_run")
+        for p in "${pids_to_rollback[@]}"; do
+            if [ -n "$p" ] && [ "$p" -ne 0 ]; then
+                if kill -0 "$p" 2>/dev/null; then
+                    kill -TERM "$p" 2>/dev/null
+                    for ((k=1; k<=5; k++)); do
+                        if ! kill -0 "$p" 2>/dev/null; then break; fi
+                        sleep 1
+                    done
+                    if kill -0 "$p" 2>/dev/null; then
+                        kill -KILL "$p" 2>/dev/null
+                    fi
+                fi
+            fi
+        done
+        if [ -f "src/scripts/worker_manager.py" ]; then
+            "$VENV_PYTHON" src/scripts/worker_manager.py reconcile >/dev/null 2>&1
+        fi
+    }
 
     # Check API health
     info "Esperando comprobaciones de salud de la API..."
@@ -300,7 +412,6 @@ cmd_start() {
     local wait=${VOD_HEALTH_INTERVAL:-1}
     local health_ok=0
 
-    # Python script para leer y parsear json recibido por argumentos
     local health_script=$(cat << 'EOF'
 import sys, json
 try:
@@ -326,39 +437,22 @@ EOF
 
     if [ "$health_ok" -eq 0 ]; then
         error "Healthcheck de la API falló. Revisar logs en $API_LOG_FILE"
-        
-        # Rollback de lo que iniciamos
-        info "Iniciando Rollback de procesos..."
-        if [ "$api_started_this_run" -eq 1 ]; then
-            graceful_kill "$API_PID_FILE" "uvicorn"
-        fi
-        if [ "$worker_started_this_run" -eq 1 ]; then
-            graceful_kill "$WORKER_PID_FILE" "run_worker"
-        fi
-        if [ "$worker_priority_started_this_run" -eq 1 ]; then
-            graceful_kill "$WORKER_PRIORITY_PID_FILE" "run_worker"
-        fi
-        if [ "$worker_ingest_started_this_run" -eq 1 ]; then
-            graceful_kill "$WORKER_INGEST_PID_FILE" "run_worker"
-        fi
-        if [ "$worker_batch_started_this_run" -eq 1 ]; then
-            graceful_kill "$WORKER_BATCH_PID_FILE" "run_worker"
-        fi
-        if [ "$worker_backup_started_this_run" -eq 1 ]; then
-            graceful_kill "$WORKER_BACKUP_PID_FILE" "run_worker"
-        fi
-        if [ "$worker_subtitles_started_this_run" -eq 1 ]; then
-            graceful_kill "$WORKER_SUBTITLES_PID_FILE" "run_worker"
-        fi
-        if [ "$worker_sync_started_this_run" -eq 1 ]; then
-            graceful_kill "$WORKER_SYNC_PID_FILE" "run_worker"
-        fi
+        rollback_started_workers
+        release_lock
         exit 1
     fi
 
     # Check Worker health
     info "Esperando comprobaciones de salud del Worker..."
-    local worker_health_script=$(cat << 'EOF'
+    local worker_health_ok=0
+    for ((i=1; i<=max_retries; i++)); do
+        if [ -f "src/scripts/worker_manager.py" ]; then
+            if "$VENV_PYTHON" src/scripts/worker_manager.py healthcheck >/dev/null 2>&1; then
+                worker_health_ok=1
+                break
+            fi
+        else
+            local worker_health_script=$(cat << 'EOF'
 import sys, time
 from redis import Redis
 from rq import Worker
@@ -367,50 +461,30 @@ from src.core.config import settings
 redis_conn = Redis.from_url(settings.REDIS_URL)
 queue_name = settings.RQ_QUEUE_NAME
 
-for _ in range(15):
-    workers = Worker.all(connection=redis_conn)
-    qnames = set()
-    for w in workers:
-        qnames.update(w.queue_names())
-    if queue_name in qnames:
-        print(", ".join(sorted(qnames)))
-        sys.exit(0)
-    time.sleep(1)
+workers = Worker.all(connection=redis_conn)
+qnames = set()
+for w in workers:
+    qnames.update(w.queue_names())
+if queue_name in qnames:
+    print(", ".join(sorted(qnames)))
+    sys.exit(0)
 sys.exit(1)
 EOF
 )
-    local worker_queue
-    if worker_queue=$("$VENV_PYTHON" -c "$worker_health_script" 2>/dev/null); then
-        success "Workers escuchando en las colas: $worker_queue"
+            if "$VENV_PYTHON" -c "$worker_health_script" >/dev/null 2>&1; then
+                worker_health_ok=1
+                break
+            fi
+        fi
+        sleep $wait
+    done
+
+    if [ "$worker_health_ok" -eq 1 ]; then
+        success "Workers activos y registrados correctamente en RQ."
     else
-        error "Healthcheck del Worker falló. No se detectaron workers escuchando en las colas esperadas."
-        
-        # Rollback de lo que iniciamos
-        info "Iniciando Rollback de procesos..."
-        if [ "$api_started_this_run" -eq 1 ]; then
-            graceful_kill "$API_PID_FILE" "uvicorn"
-        fi
-        if [ "$worker_started_this_run" -eq 1 ]; then
-            graceful_kill "$WORKER_PID_FILE" "run_worker"
-        fi
-        if [ "$worker_priority_started_this_run" -eq 1 ]; then
-            graceful_kill "$WORKER_PRIORITY_PID_FILE" "run_worker"
-        fi
-        if [ "$worker_ingest_started_this_run" -eq 1 ]; then
-            graceful_kill "$WORKER_INGEST_PID_FILE" "run_worker"
-        fi
-        if [ "$worker_batch_started_this_run" -eq 1 ]; then
-            graceful_kill "$WORKER_BATCH_PID_FILE" "run_worker"
-        fi
-        if [ "$worker_backup_started_this_run" -eq 1 ]; then
-            graceful_kill "$WORKER_BACKUP_PID_FILE" "run_worker"
-        fi
-        if [ "$worker_subtitles_started_this_run" -eq 1 ]; then
-            graceful_kill "$WORKER_SUBTITLES_PID_FILE" "run_worker"
-        fi
-        if [ "$worker_sync_started_this_run" -eq 1 ]; then
-            graceful_kill "$WORKER_SYNC_PID_FILE" "run_worker"
-        fi
+        error "Healthcheck del Worker falló. No se detectaron todos los workers esperados registrados."
+        rollback_started_workers
+        release_lock
         exit 1
     fi
 
@@ -422,18 +496,26 @@ EOF
     echo -e "Swagger UI:  ${CYAN}http://localhost:${VOD_API_PORT}/docs${NC}"
     echo -e "Nginx / HLS: ${CYAN}http://localhost:${VOD_NGINX_PORT}${NC}"
     echo ""
+    release_lock
     cmd_status
 }
 
 cmd_stop() {
+    acquire_lock
+    check_deps
     info "Deteniendo servicios VOD..."
-    graceful_kill "$WORKER_SYNC_PID_FILE" "run_worker"
-    graceful_kill "$WORKER_SUBTITLES_PID_FILE" "run_worker"
-    graceful_kill "$WORKER_BACKUP_PID_FILE" "run_worker"
-    graceful_kill "$WORKER_BATCH_PID_FILE" "run_worker"
-    graceful_kill "$WORKER_INGEST_PID_FILE" "run_worker"
-    graceful_kill "$WORKER_PRIORITY_PID_FILE" "run_worker"
-    graceful_kill "$WORKER_PID_FILE" "run_worker"
+    if [ -f "src/scripts/worker_manager.py" ]; then
+        "$VENV_PYTHON" src/scripts/worker_manager.py stop-all
+
+    else
+        graceful_kill "$WORKER_SYNC_PID_FILE" "run_worker"
+        graceful_kill "$WORKER_SUBTITLES_PID_FILE" "run_worker"
+        graceful_kill "$WORKER_BACKUP_PID_FILE" "run_worker"
+        graceful_kill "$WORKER_BATCH_PID_FILE" "run_worker"
+        graceful_kill "$WORKER_INGEST_PID_FILE" "run_worker"
+        graceful_kill "$WORKER_PRIORITY_PID_FILE" "run_worker"
+        graceful_kill "$WORKER_PID_FILE" "run_worker"
+    fi
     graceful_kill "$API_PID_FILE" "uvicorn"
     
     info "Deteniendo contenedores Docker..."
@@ -442,6 +524,19 @@ cmd_stop() {
         $dc_cmd down || warning "Error al ejecutar docker compose down."
     fi
     success "Todos los servicios han sido detenidos."
+    release_lock
+}
+
+cmd_repair_workers() {
+    check_deps
+    acquire_lock
+    info "Ejecutando reconciliación y reparación de workers..."
+    if [ -f "src/scripts/worker_manager.py" ]; then
+        "$VENV_PYTHON" src/scripts/worker_manager.py repair
+    else
+        warning "src/scripts/worker_manager.py no encontrado."
+    fi
+    release_lock
 }
 
 cmd_status() {
@@ -462,48 +557,52 @@ cmd_status() {
         echo -e "API:              ${RED}Detenida${NC}"
     fi
 
-    echo -e "\n${CYAN}TRANSCODE WORKERS:${NC}"
-    if check_pid_running "$WORKER_PRIORITY_PID_FILE" "run_worker"; then
-        echo -e "Priority Worker:  ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_PRIORITY_PID_FILE), Queue: vod_priority)"
+    if [ -f "src/scripts/worker_manager.py" ]; then
+        "$VENV_PYTHON" src/scripts/worker_manager.py status
     else
-        echo -e "Priority Worker:  ${RED}Detenido${NC}"
-    fi
+        echo -e "\n${CYAN}TRANSCODE WORKERS:${NC}"
+        if check_pid_running "$WORKER_PRIORITY_PID_FILE" "run_worker"; then
+            echo -e "Priority Worker:  ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_PRIORITY_PID_FILE), Queue: vod_priority)"
+        else
+            echo -e "Priority Worker:  ${RED}Detenido${NC}"
+        fi
 
-    if check_pid_running "$WORKER_INGEST_PID_FILE" "run_worker"; then
-        echo -e "Ingest Worker:    ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_INGEST_PID_FILE), Queue: vod_ingest)"
-    else
-        echo -e "Ingest Worker:    ${RED}Detenido${NC}"
-    fi
+        if check_pid_running "$WORKER_INGEST_PID_FILE" "run_worker"; then
+            echo -e "Ingest Worker:    ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_INGEST_PID_FILE), Queue: vod_ingest)"
+        else
+            echo -e "Ingest Worker:    ${RED}Detenido${NC}"
+        fi
 
-    if check_pid_running "$WORKER_BATCH_PID_FILE" "run_worker"; then
-        echo -e "Batch Worker:     ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_BATCH_PID_FILE), Queue: vod_batch)"
-    else
-        echo -e "Batch Worker:     ${RED}Detenido${NC}"
-    fi
+        if check_pid_running "$WORKER_BATCH_PID_FILE" "run_worker"; then
+            echo -e "Batch Worker:     ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_BATCH_PID_FILE), Queue: vod_batch)"
+        else
+            echo -e "Batch Worker:     ${RED}Detenido${NC}"
+        fi
 
-    if check_pid_running "$WORKER_PID_FILE" "run_worker"; then
-        echo -e "Legacy Worker:    ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_PID_FILE), Queue: vod_tasks)"
-    else
-        echo -e "Legacy Worker:    ${RED}Detenido${NC}"
-    fi
+        if check_pid_running "$WORKER_PID_FILE" "run_worker"; then
+            echo -e "Legacy Worker:    ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_PID_FILE), Queue: vod_tasks)"
+        else
+            echo -e "Legacy Worker:    ${RED}Detenido${NC}"
+        fi
 
-    echo -e "\n${CYAN}POST-PROCESS WORKERS:${NC}"
-    if check_pid_running "$WORKER_BACKUP_PID_FILE" "run_worker"; then
-        echo -e "Backup Worker:    ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_BACKUP_PID_FILE), Queue: vod_backup)"
-    else
-        echo -e "Backup Worker:    ${RED}Detenido${NC}"
-    fi
+        echo -e "\n${CYAN}POST-PROCESS WORKERS:${NC}"
+        if check_pid_running "$WORKER_BACKUP_PID_FILE" "run_worker"; then
+            echo -e "Backup Worker:    ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_BACKUP_PID_FILE), Queue: vod_backup)"
+        else
+            echo -e "Backup Worker:    ${RED}Detenido${NC}"
+        fi
 
-    if check_pid_running "$WORKER_SUBTITLES_PID_FILE" "run_worker"; then
-        echo -e "Subtitles Worker: ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_SUBTITLES_PID_FILE), Queue: vod_subtitles)"
-    else
-        echo -e "Subtitles Worker: ${RED}Detenido${NC}"
-    fi
+        if check_pid_running "$WORKER_SUBTITLES_PID_FILE" "run_worker"; then
+            echo -e "Subtitles Worker: ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_SUBTITLES_PID_FILE), Queue: vod_subtitles)"
+        else
+            echo -e "Subtitles Worker: ${RED}Detenido${NC}"
+        fi
 
-    if check_pid_running "$WORKER_SYNC_PID_FILE" "run_worker"; then
-        echo -e "Sync Worker:      ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_SYNC_PID_FILE), Queue: vod_sync)"
-    else
-        echo -e "Sync Worker:      ${RED}Detenido${NC}"
+        if check_pid_running "$WORKER_SYNC_PID_FILE" "run_worker"; then
+            echo -e "Sync Worker:      ${GREEN}Corriendo${NC} (PID: $(cat $WORKER_SYNC_PID_FILE), Queue: vod_sync)"
+        else
+            echo -e "Sync Worker:      ${RED}Detenido${NC}"
+        fi
     fi
 
     echo -e "\n${CYAN}--- HEALTHCHECKS ---${NC}"
@@ -868,6 +967,8 @@ cmd_help() {
     echo "                  Uso: ./vod.sh new-video-scan [--dry-run] [--root PATH] [--stable-seconds N]"
     echo "  workflow-retry  Reintenta un paso fallido de post-procesamiento (AZURE_BACKUP, SUBTITLES, ENLACE_SYNC)."
     echo "                  Uso: ./vod.sh workflow-retry <ASSET> <STEP_TYPE> [--force]"
+    echo "  repair-workers  Reconcilia workers, limpia duplicados y stale PID/RQ records."
+    echo "                  (Alias: workers-clean)"
     echo ""
     echo "Ejemplo completo:"
     echo "  cp /ruta/del/video/PREDI-MVIDA464.mp4 storage/input/"
@@ -897,6 +998,9 @@ case "$COMMAND" in
         ;;
     status)
         cmd_status
+        ;;
+    repair-workers|workers-clean)
+        cmd_repair_workers
         ;;
     logs)
         cmd_logs "$@"
@@ -937,3 +1041,4 @@ case "$COMMAND" in
         exit 1
         ;;
 esac
+

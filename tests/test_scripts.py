@@ -35,7 +35,8 @@ def test_run_worker_execution(mock_redis, mock_worker):
 
     mock_redis.from_url.assert_called_once()
     mock_worker.assert_called_once()
-    mock_worker_instance.work.assert_called_once_with(with_scheduler=True, burst=True)
+    mock_worker_instance.work.assert_called_once_with(with_scheduler=False, burst=True)
+
 
 def test_reconcile_staging_clean(tmp_path):
     old_root = settings.STAGING_ROOT

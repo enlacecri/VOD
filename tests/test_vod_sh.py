@@ -168,9 +168,30 @@ exec "{real_python}" "$@"
         (tmp_path / "storage" / "run").mkdir(parents=True, exist_ok=True)
         proc = subprocess.Popen(["sleep", "60"])
         (tmp_path / "storage" / "run" / "api.pid").write_text(str(proc.pid))
-        return proc
+    yield run_vod, tmp_path, bin_dir, inject_curl_api_alive, start_fake_api, mk
 
-    return run_vod, tmp_path, bin_dir, inject_curl_api_alive, start_fake_api, mk
+    # Teardown fixture: ensure no background processes from this test leak
+    run_dir = tmp_path / "storage" / "run"
+    if run_dir.exists():
+        for pid_file in run_dir.glob("*.pid"):
+            try:
+                pid = int(pid_file.read_text().strip())
+                os.kill(pid, 15)
+            except Exception:
+                pass
+    try:
+        pids = subprocess.check_output(["pgrep", "-f", "run_worker.py"], text=True).split()
+        for p in pids:
+            try:
+                out = subprocess.check_output(["lsof", "-a", "-p", p, "-d", "cwd", "-Fn"], text=True, timeout=1.0)
+                for line in out.splitlines():
+                    if line.startswith("n") and str(tmp_path) in line:
+                        os.kill(int(p), 9)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 
 
 # ── Tests de start ──────────────────────────────────────────────────────────
@@ -633,6 +654,8 @@ except KeyboardInterrupt:
     
     args = (tmp / "worker_args.txt").read_text()
     assert "run_worker.py" in args
+    run_vod("stop")
+
 
 
 def test_vod_sh_help_includes_prewarm_commands(env_root):
