@@ -834,6 +834,11 @@ cmd_workflow_retry() {
     "$VENV_PYTHON" -m src.scripts.workflow_retry "$@"
 }
 
+cmd_reset() {
+    check_deps
+    "$VENV_PYTHON" -m src.scripts.reset_asset "$@"
+}
+
 cmd_help() {
     echo -e "${CYAN}VOD MVP Management Script${NC}"
     echo "========================="
@@ -849,6 +854,8 @@ cmd_help() {
     echo "  ingest          Registra un archivo de origen. Uso: ./vod.sh ingest <SOURCE_URI>"
     echo "                  (Ej: ./vod.sh ingest programas/PREDI-MVIDA464.mp4)"
     echo "  ingest-all      Escanea y registra todos los archivos válidos en INGEST_ROOT."
+    echo "  reset           Desprocesa/resetea un video para demos o pruebas."
+    echo "                  Uso: ./vod.sh reset <ENLACE_ID> [--list] [--move]"
     echo "  catalog-import  Registro masivo del catálogo como assets COLD sin transcodificar."
     echo "                  Uso: ./vod.sh catalog-import [--dry-run] [--limit N] [--root PATH]"
     echo "  batch-enqueue   Encola un asset COLD para procesamiento en segundo plano (vod_batch)."
@@ -917,6 +924,9 @@ case "$COMMAND" in
         ;;
     workflow-retry)
         cmd_workflow_retry "$@"
+        ;;
+    reset)
+        cmd_reset "$@"
         ;;
     help|"")
         cmd_help

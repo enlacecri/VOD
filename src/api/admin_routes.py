@@ -30,10 +30,15 @@ def _calculate_metrics(asset: Asset) -> dict:
     if not asset.jobs:
         return {
             "queue_wait_seconds": None,
+            "queue_time_seconds": None,
             "probe_processing_seconds": None,
             "transcode_processing_seconds": None,
             "total_processing_seconds": None,
             "elapsed_wall_seconds": None,
+            "processing_started_at": None,
+            "processing_finished_at": None,
+            "processing_time_seconds": None,
+            "processing_ratio": None,
         }
 
     first_job = min(asset.jobs, key=lambda j: j.created_at)
@@ -73,12 +78,50 @@ def _calculate_metrics(asset: Asset) -> dict:
     if end_time:
         elapsed_wall = (end_time - first_job.created_at).total_seconds()
 
+    # Pipeline real processing timestamps
+    started_jobs = [j for j in asset.jobs if j.started_at is not None]
+    processing_started_at = min((j.started_at for j in started_jobs), default=None)
+
+    processing_finished_at = None
+    if asset.status == VideoStatus.READY:
+        processing_finished_at = (
+            asset.published_at
+            or (latest_transcode.finished_at if latest_transcode else None)
+            or max((j.finished_at for j in asset.jobs if j.finished_at), default=None)
+        )
+    elif asset.status == VideoStatus.FAILED:
+        failed_jobs = [j for j in asset.jobs if j.status == JobStatus.FAILED and j.finished_at]
+        processing_finished_at = max((j.finished_at for j in failed_jobs), default=None)
+
+    processing_time_seconds = None
+    if processing_started_at and processing_finished_at:
+        processing_time_seconds = round(max(0.0, (processing_finished_at - processing_started_at).total_seconds()), 2)
+
+    processing_ratio = None
+    if (
+        asset.status == VideoStatus.READY
+        and processing_time_seconds is not None
+        and asset.duration_seconds
+        and asset.duration_seconds > 0
+    ):
+        processing_ratio = round(processing_time_seconds / asset.duration_seconds, 2)
+
+    queue_time_seconds = queue_wait if valid_wait else (
+        round((processing_started_at - asset.created_at).total_seconds(), 2)
+        if (processing_started_at and asset.created_at) else None
+    )
+
     return {
         "queue_wait_seconds": queue_wait if valid_wait else None,
+        "queue_time_seconds": queue_time_seconds,
         "probe_processing_seconds": probe_processing,
         "transcode_processing_seconds": transcode_processing,
         "total_processing_seconds": total_processing,
         "elapsed_wall_seconds": elapsed_wall,
+        "processing_started_at": processing_started_at,
+        "processing_finished_at": processing_finished_at,
+        "processing_time_seconds": processing_time_seconds,
+        "processing_ratio": processing_ratio,
     }
 
 

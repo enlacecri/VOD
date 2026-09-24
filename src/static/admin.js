@@ -1,5 +1,5 @@
-const state = { key: sessionStorage.getItem("vodAdminKey") || "", timer: null };
-const $ = (id) => document.getElementById(id);
+const state = { key: (typeof sessionStorage !== "undefined" ? sessionStorage.getItem("vodAdminKey") : "") || "", timer: null };
+const $ = (id) => (typeof document !== "undefined" ? document.getElementById(id) : null);
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -171,16 +171,44 @@ async function fetchAndRenderAssets(status, listId, emptyId, totalId) {
   }
 }
 
+let activeTicker = null;
+
 function formatDuration(seconds) {
-  if (seconds == null || seconds === "") return "";
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.round(seconds % 60);
+  if (seconds == null || seconds === "" || isNaN(seconds) || seconds < 0) return "—";
+  const total = Math.round(Number(seconds));
+  if (total === 0) return "0s";
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
   const parts = [];
   if (h > 0) parts.push(`${h}h`);
   if (m > 0) parts.push(`${m}m`);
   if (s > 0 || parts.length === 0) parts.push(`${s}s`);
   return parts.join(" ");
+}
+
+function formatRatio(ratio) {
+  if (ratio == null || ratio === "" || isNaN(ratio)) return "—";
+  return `${Number(ratio).toFixed(2)}x`;
+}
+
+function startActiveTimer() {
+  if (activeTicker) clearInterval(activeTicker);
+  activeTicker = setInterval(() => {
+    const timerNodes = document.querySelectorAll("[data-started-at]");
+    if (timerNodes.length === 0) {
+      clearInterval(activeTicker);
+      activeTicker = null;
+      return;
+    }
+    timerNodes.forEach((el) => {
+      const started = new Date(el.dataset.startedAt).getTime();
+      if (!isNaN(started)) {
+        const sec = Math.max(0, Math.floor((Date.now() - started) / 1000));
+        el.textContent = `Procesando: ${formatDuration(sec)}`;
+      }
+    });
+  }, 1000);
 }
 
 function showDetails(asset) {
@@ -217,8 +245,8 @@ function showDetails(asset) {
   
   addRow("UUID", asset.vod_uuid);
   addRow("Estado", asset.status);
-  addRow("Duración del video", asset.duration_seconds ? formatDuration(asset.duration_seconds) : "N/D");
-  addRow("Resolución", (asset.source_width && asset.source_height) ? `${asset.source_width}x${asset.source_height}` : "N/D");
+  addRow("Duración del video", formatDuration(asset.duration_seconds));
+  addRow("Resolución", (asset.source_width && asset.source_height) ? `${asset.source_width}x${asset.source_height}` : "—");
   addRow("Video Codec", asset.video_codec);
   addRow("Audio Codec", asset.audio_codec);
   addRow("Publicado", asset.published_at ? new Date(asset.published_at).toLocaleString() : "N/D");
@@ -228,9 +256,12 @@ function showDetails(asset) {
   addRow("URL Playback", asset.playback_url);
   
   addDivider("Métricas de Procesamiento");
-  addRow("Tiempo procesando", formatDuration(asset.total_processing_seconds));
-  addRow("Tiempo esperando en cola", formatDuration(asset.queue_wait_seconds));
-  addRow("Duración de análisis", formatDuration(asset.probe_processing_seconds));
+  addRow("Tiempo de procesamiento", asset.processing_time_seconds != null ? formatDuration(asset.processing_time_seconds) : "—");
+  addRow("Ratio de procesamiento", formatRatio(asset.processing_ratio));
+  addRow("Inicio de procesamiento", asset.processing_started_at ? new Date(asset.processing_started_at).toLocaleString() : "N/D");
+  addRow("Fin de procesamiento", asset.processing_finished_at ? new Date(asset.processing_finished_at).toLocaleString() : "N/D");
+  addRow("Tiempo esperando en cola", asset.queue_time_seconds != null ? formatDuration(asset.queue_time_seconds) : (asset.queue_wait_seconds != null ? formatDuration(asset.queue_wait_seconds) : "—"));
+  addRow("Duración de análisis (probe)", formatDuration(asset.probe_processing_seconds));
   addRow("Duración de transcodificación", formatDuration(asset.transcode_processing_seconds));
   
   if (asset.elapsed_wall_seconds != null) {
@@ -257,6 +288,17 @@ function showDetails(asset) {
     vp.append(ul);
     body.append(vp);
   }
+
+  if (asset.playback_url) {
+    const playP = document.createElement("p");
+    playP.style.marginTop = "16px";
+    const playBtn = document.createElement("button");
+    playBtn.className = "button primary";
+    playBtn.textContent = "▶ Abrir en Reproductor Web";
+    playBtn.addEventListener("click", () => window.open(`/experimental/asset-player?vod_uuid=${asset.vod_uuid}`, "_blank"));
+    playP.append(playBtn);
+    body.append(playP);
+  }
   
   $("detailsModal").classList.remove("hidden");
 }
@@ -274,31 +316,98 @@ function renderAssetList(assets, listId, emptyId, totalId, showProgress) {
     
     const info = document.createElement("div"); info.className = "asset-info";
     if (showProgress) {
-      const statusText = document.createElement("div"); statusText.textContent = `Estado: ${asset.status}`;
-      const progTrack = document.createElement("div"); progTrack.className = "bar-track"; progTrack.style.width = "100px"; progTrack.style.display = "inline-block"; progTrack.style.marginLeft = "10px";
-      const progFill = document.createElement("div"); progFill.className = "bar-fill"; progFill.style.width = `${asset.progress}%`;
-      progTrack.append(progFill);
-      const progText = document.createElement("span"); progText.textContent = ` ${asset.progress}%`;
-      info.append(statusText, progTrack, progText);
+      if (asset.status === "failed") {
+        const statusText = document.createElement("span");
+        statusText.style.color = "var(--red)";
+        statusText.style.fontWeight = "700";
+        statusText.textContent = "Falló";
+
+        const timeText = document.createElement("span");
+        timeText.textContent = asset.processing_time_seconds != null 
+          ? `Falló después de ${formatDuration(asset.processing_time_seconds)}` 
+          : "—";
+
+        const ratioSpan = document.createElement("span");
+        ratioSpan.className = "ratio-badge";
+        ratioSpan.textContent = "—";
+
+        const date = document.createElement("span");
+        date.textContent = asset.updated_at ? new Date(asset.updated_at).toLocaleDateString() : (asset.created_at ? new Date(asset.created_at).toLocaleDateString() : "—");
+
+        info.append(statusText, timeText, ratioSpan, date);
+      } else {
+        const statusText = document.createElement("span");
+        statusText.textContent = asset.progress ? `Procesando · ${asset.progress}%` : `Estado: ${asset.status}`;
+        statusText.style.fontWeight = "600";
+        statusText.style.color = "var(--ink)";
+
+        if (asset.progress != null && asset.progress > 0) {
+          const progTrack = document.createElement("div"); progTrack.className = "bar-track"; progTrack.style.width = "80px"; progTrack.style.display = "inline-block";
+          const progFill = document.createElement("div"); progFill.className = "bar-fill"; progFill.style.width = `${asset.progress}%`;
+          progTrack.append(progFill);
+          info.append(statusText, progTrack);
+        } else {
+          info.append(statusText);
+        }
+
+        const timerSpan = document.createElement("span");
+        if (asset.processing_started_at) {
+          const elapsed = Math.max(0, Math.floor((Date.now() - new Date(asset.processing_started_at).getTime()) / 1000));
+          timerSpan.textContent = `Procesando: ${formatDuration(elapsed)}`;
+          timerSpan.setAttribute("data-started-at", asset.processing_started_at);
+        } else {
+          timerSpan.textContent = "En cola";
+        }
+
+        const ratioSpan = document.createElement("span");
+        ratioSpan.className = "ratio-badge";
+        ratioSpan.textContent = "—";
+        ratioSpan.title = "Ratio no disponible mientras el video esté en procesamiento";
+
+        const date = document.createElement("span");
+        date.textContent = asset.created_at ? new Date(asset.created_at).toLocaleDateString() : "—";
+
+        info.append(timerSpan, ratioSpan, date);
+      }
     } else {
-      const duration = document.createElement("span"); duration.textContent = formatDuration(asset.duration_seconds);
-      const res = document.createElement("span"); res.textContent = (asset.source_width && asset.source_height) ? `${asset.source_width}x${asset.source_height}` : "";
-      const date = document.createElement("span"); date.textContent = asset.published_at ? new Date(asset.published_at).toLocaleDateString() : "";
-      duration.style.marginRight = "15px"; res.style.marginRight = "15px";
-      info.append(duration, res, date);
+      const duration = document.createElement("span");
+      duration.textContent = formatDuration(asset.duration_seconds);
+
+      const res = document.createElement("span");
+      res.textContent = (asset.source_width && asset.source_height) ? `${asset.source_width}x${asset.source_height}` : "—";
+
+      const proc = document.createElement("span");
+      proc.textContent = asset.processing_time_seconds != null
+        ? `Procesó en ${formatDuration(asset.processing_time_seconds)}`
+        : "—";
+
+      const ratioSpan = document.createElement("span");
+      ratioSpan.className = "ratio-badge";
+      ratioSpan.textContent = formatRatio(asset.processing_ratio);
+      if (asset.processing_ratio != null) {
+        const pct = Math.round(asset.processing_ratio * 100);
+        ratioSpan.title = `Tiempo de procesamiento ÷ duración del video (${pct}% de la duración)`;
+      } else {
+        ratioSpan.title = "Ratio no disponible";
+      }
+
+      const date = document.createElement("span");
+      date.textContent = asset.published_at ? new Date(asset.published_at).toLocaleDateString() : (asset.created_at ? new Date(asset.created_at).toLocaleDateString() : "—");
+
+      info.append(duration, res, proc, ratioSpan, date);
     }
     
     const actions = document.createElement("div"); actions.className = "action-group";
     
     if (asset.playback_url) {
-      const btnOpen = document.createElement("button"); btnOpen.className = "button ghost"; btnOpen.textContent = "Abrir video";
-      btnOpen.addEventListener("click", () => window.open(asset.playback_url, "_blank"));
+      const btnOpen = document.createElement("button"); btnOpen.className = "button primary"; btnOpen.textContent = "▶ Reproducir";
+      btnOpen.addEventListener("click", () => window.open(`/experimental/asset-player?vod_uuid=${asset.vod_uuid}`, "_blank"));
       
-      const btnCopy = document.createElement("button"); btnCopy.className = "button ghost"; btnCopy.textContent = "Copiar URL";
+      const btnCopy = document.createElement("button"); btnCopy.className = "button ghost"; btnCopy.textContent = "Copiar HLS";
       btnCopy.addEventListener("click", async () => {
         try {
           await navigator.clipboard.writeText(asset.playback_url);
-          showToast("URL copiada");
+          showToast("URL HLS copiada al portapapeles");
         } catch (e) {
           showToast("Error copiando URL");
         }
@@ -313,4 +422,15 @@ function renderAssetList(assets, listId, emptyId, totalId, showProgress) {
     row.append(title, info, actions);
     list.append(row);
   });
+
+  startActiveTimer();
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    formatDuration,
+    formatRatio,
+    renderAssetList,
+    showDetails,
+  };
 }
