@@ -84,12 +84,31 @@ def cmd_status():
 
     print("Resources")
     print("------------------------------------------------")
-    print(f"CPU:                       {res['cpu_percent']}%")
+    cpu_curr = res['cpu_percent']
+    cpu_start_th = settings.TRANSCODE_CPU_START_THRESHOLD
+    cpu_hard_th = settings.TRANSCODE_CPU_HARD_THRESHOLD
+    cpu_adm = "OK" if cpu_curr < cpu_start_th else ("PRIORITY ONLY" if cpu_curr < cpu_hard_th else "BLOCKED")
+    print(f"CPU current:               {cpu_curr}%")
+    print(f"CPU start threshold:       {cpu_start_th}%")
+    print(f"CPU hard threshold:        {cpu_hard_th}%")
+    print(f"CPU admission:             {cpu_adm}")
     load_1m = res['load_average'][0]
     cores = res['cpu_count']
     print(f"Load:                      {load_1m} / {cores} cores")
-    print(f"Memory available:          {res['memory_available_mb'] / 1024:.1f} GB")
-    print(f"Disk free:                 {res['disk_free_gb']:.1f} GB")
+
+    mem_avail = res['memory_available_mb']
+    mem_min = settings.TRANSCODE_MIN_AVAILABLE_MEMORY_MB
+    mem_adm = "OK" if mem_avail >= mem_min else "BLOCKED"
+    print(f"Memory available:          {mem_avail / 1024:.1f} GB ({mem_avail} MB)")
+    print(f"Memory minimum required:   {mem_min / 1024:.1f} GB ({mem_min} MB)")
+    print(f"Memory admission:          {mem_adm}")
+
+    disk_free = res['disk_free_gb']
+    disk_min = float(settings.TRANSCODE_MIN_FREE_DISK_GB)
+    disk_adm = "OK" if disk_free >= disk_min else "BLOCKED"
+    print(f"Disk free:                 {disk_free:.1f} GB")
+    print(f"Disk minimum required:     {disk_min:.1f} GB")
+    print(f"Disk admission:            {disk_adm}")
     print()
 
     print("Active")

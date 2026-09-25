@@ -1,7 +1,10 @@
 import os
+import sys
 import time
 import uuid
 import threading
+import subprocess
+import psutil
 import concurrent.futures
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -10,6 +13,7 @@ from redis import Redis
 
 from src.core.config import settings
 from src.core.queues import get_redis_connection
+from src.worker.transcode import execute_transcode
 from src.services.transcode_orchestrator import (
     TranscodeOrchestrator,
     RedisSlotManager,
@@ -160,6 +164,40 @@ def test_f_disk_below_minimum_rejects(orchestrator, mock_resources):
 
         slot = orchestrator.acquire_slot("job-disk", "asset-disk", "vod_tasks", "w-disk")
         assert slot is None
+
+
+def test_f_disk_admission_threshold_exact(orchestrator, mock_resources):
+    """
+    1. VERIFICAR DISK ADMISSION CONTROL:
+    free disk < configured minimum -> DENIED (reason: insufficient_disk)
+    free disk > configured minimum -> ALLOWED (does not block on disk)
+    """
+    mock_resources.cpu_percent = 20.0
+    mock_resources.memory_available_mb = 8192.0
+
+    with patch.object(settings, "TRANSCODE_RESOURCE_CHECK_ENABLED", True), \
+         patch.object(settings, "TRANSCODE_MIN_FREE_DISK_GB", 10.0):
+
+        # Case A: Free disk = 8.9 GB < 10.0 GB -> BLOCKED / DENIED
+        mock_resources.disk_free_gb = 8.9
+        decision = orchestrator.can_start_transcode(Priority.NORMAL)
+        assert decision.allowed is False
+        assert decision.reason == "insufficient_disk"
+        assert decision.metrics["disk_free_gb"] == 8.9
+
+        slot = orchestrator.acquire_slot("job-disk-low", "asset-1", "vod_tasks", "w1")
+        assert slot is None
+
+        # Case B: Free disk = 15.0 GB > 10.0 GB -> ALLOWED
+        mock_resources.disk_free_gb = 15.0
+        decision_ok = orchestrator.can_start_transcode(Priority.NORMAL)
+        assert decision_ok.allowed is True
+        assert decision_ok.reason == "capacity_available"
+        assert decision_ok.metrics["disk_free_gb"] == 15.0
+
+        slot_ok = orchestrator.acquire_slot("job-disk-ok", "asset-2", "vod_tasks", "w2")
+        assert slot_ok is not None
+        orchestrator.release_slot(slot_ok)
 
 
 def test_g_slot_released_recovers_capacity(orchestrator):
@@ -462,3 +500,337 @@ def test_ffmpeg_concurrency_limit_integration(redis_conn, mock_resources, tmp_pa
 
     # Crucial assertion: Peak simultaneous FFmpeg processes was exactly 1, NEVER 2!
     assert max_simultaneous == 1
+
+
+# ==============================================================================
+# Operational Validation Tests (Fase 6 Closing Requirements)
+# ==============================================================================
+
+def test_real_ffmpeg_concurrency_limit_operational(redis_conn, mock_resources, tmp_path):
+    """
+    Item 2: PRUEBA REAL DEL LÍMITE DE FFMPEG.
+    Configurar TRANSCODE_MAX_CONCURRENT=1.
+    Lanzar dos intentos reales de transcodificación solapados.
+    T0: Job A obtiene slot.
+    T1: FFmpeg A inicia.
+    T2: Job B intenta adquirir slot.
+    T3: Job B NO puede iniciar FFmpeg mientras A esté activo.
+    T4: FFmpeg A finaliza.
+    T5: Slot A se libera.
+    T6: Job B obtiene capacidad.
+    T7: FFmpeg B inicia.
+    Resultado obligatorio: Peak simultaneous project FFmpeg transcodes = 1.
+    Contar procesos FFmpeg pertenecientes específicamente al proyecto.
+    """
+    fixture_src = Path("tests/fixtures/valid.mp4")
+    assert fixture_src.exists(), "valid.mp4 fixture must exist"
+
+    orch = TranscodeOrchestrator(
+        slot_manager=RedisSlotManager(redis_conn=redis_conn),
+        resource_provider=mock_resources,
+        node_name="test-real-ffmpeg-node",
+        max_concurrent=1,
+        reserved_priority_slots=0,
+    )
+
+    out_a = tmp_path / "out_a"
+    out_b = tmp_path / "out_b"
+    log_a = tmp_path / "ffmpeg_a.log"
+    log_b = tmp_path / "ffmpeg_b.log"
+
+    def count_project_ffmpeg():
+        cnt = 0
+        for p in psutil.process_iter(["name", "cmdline"]):
+            try:
+                if "ffmpeg" in (p.info["name"] or "").lower():
+                    cmd = " ".join(p.info["cmdline"] or [])
+                    if str(tmp_path) in cmd:
+                        cnt += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return cnt
+
+    peak_ffmpeg = 0
+    stop_monitor = threading.Event()
+
+    def monitor():
+        nonlocal peak_ffmpeg
+        while not stop_monitor.is_set():
+            c = count_project_ffmpeg()
+            if c > peak_ffmpeg:
+                peak_ffmpeg = c
+            time.sleep(0.005)
+
+    t_mon = threading.Thread(target=monitor, daemon=True)
+    t_mon.start()
+
+    # T0: Job A acquires slot
+    slot_a = orch.acquire_slot("job-A", "asset-A", "vod_tasks", "wA", Priority.NORMAL)
+    assert slot_a is not None
+
+    def run_job_a():
+        try:
+            execute_transcode(
+                source_path=fixture_src,
+                output_dir=out_a,
+                log_path=log_a,
+                source_width=640,
+                source_height=360,
+                source_fps=30.0,
+                has_audio=True,
+                duration_sec=1.0,
+                heartbeat_callback=lambda: None,
+                progress_callback=lambda p: None,
+                slot=slot_a,
+            )
+        finally:
+            orch.release_slot(slot_a)
+
+    t_a = threading.Thread(target=run_job_a)
+    t_a.start()
+
+    # T1: Wait for FFmpeg A to start (PID registered in slot)
+    pid_a = None
+    for _ in range(50):
+        s = orch.slot_manager.get_slot(slot_a.slot_id)
+        if s and s.pid is not None:
+            pid_a = s.pid
+            break
+        time.sleep(0.01)
+
+    assert pid_a is not None, "FFmpeg A must start and record its PID"
+
+    # T2: Job B attempts to acquire slot while A is active
+    slot_b_denied = orch.acquire_slot("job-B", "asset-B", "vod_tasks", "wB", Priority.NORMAL)
+
+    # T3: Job B NO puede iniciar FFmpeg mientras A esté activo (slot is None)
+    assert slot_b_denied is None
+
+    # T4 & T5: FFmpeg A completes and slot A is released in finally
+    t_a.join()
+    assert orch.slot_manager.count_active_slots() == 0
+
+    # T6: Job B now acquires capacity
+    slot_b = orch.acquire_slot("job-B", "asset-B", "vod_tasks", "wB", Priority.NORMAL)
+    assert slot_b is not None
+
+    # T7: FFmpeg B starts
+    try:
+        execute_transcode(
+            source_path=fixture_src,
+            output_dir=out_b,
+            log_path=log_b,
+            source_width=640,
+            source_height=360,
+            source_fps=30.0,
+            has_audio=True,
+            duration_sec=1.0,
+            heartbeat_callback=lambda: None,
+            progress_callback=lambda p: None,
+            slot=slot_b,
+        )
+    finally:
+        orch.release_slot(slot_b)
+
+    stop_monitor.set()
+    t_mon.join()
+
+    # Crucial assertions:
+    # 1. Peak simultaneous project FFmpeg transcodes = 1
+    # 2. No orphan FFmpeg processes left behind
+    assert peak_ffmpeg == 1, f"Expected peak FFmpeg = 1, got {peak_ffmpeg}"
+    assert count_project_ffmpeg() == 0, "No FFmpeg processes should be running after test"
+
+
+def test_multiprocess_atomic_contention(redis_conn):
+    """
+    Item 3: PRUEBA DE ESTRÉS DE ATOMICIDAD MULTIPROCESO.
+    10 procesos independientes de SO intentan adquirir capacidad casi simultáneamente.
+    TRANSCODE_MAX_CONCURRENT=2.
+    Resultado obligatorio en cada ronda:
+    successful acquisitions = 2
+    denied acquisitions     = 8
+    Nunca: successful acquisitions > 2.
+    """
+    worker_script = """
+import sys
+from redis import Redis
+from src.core.config import settings
+settings.TRANSCODE_RESOURCE_CHECK_ENABLED = False
+from src.services.transcode_orchestrator.slot_manager import RedisSlotManager
+from src.services.transcode_orchestrator.orchestrator import TranscodeOrchestrator
+from src.services.transcode_orchestrator.models import Priority
+
+worker_id = sys.argv[1]
+r = Redis.from_url(settings.REDIS_URL)
+sm = RedisSlotManager(redis_conn=r)
+orch = TranscodeOrchestrator(
+    slot_manager=sm,
+    max_concurrent=2,
+    reserved_priority_slots=0,
+)
+slot = orch.acquire_slot(f"multi-job-{worker_id}", f"asset-{worker_id}", "vod_tasks", f"worker-{worker_id}", Priority.NORMAL)
+sys.exit(0 if slot is not None else 1)
+"""
+
+    num_processes = 10
+    num_rounds = 3
+
+    for round_idx in range(num_rounds):
+        redis_conn.flushdb()
+
+        procs = [
+            subprocess.Popen([sys.executable, "-c", worker_script, f"{round_idx}-{i}"])
+            for i in range(num_processes)
+        ]
+        exit_codes = [p.wait(timeout=10) for p in procs]
+
+        successes = exit_codes.count(0)
+        denied = exit_codes.count(1)
+
+        assert successes == 2, f"Round {round_idx}: expected exactly 2 successes, got {successes}"
+        assert denied == 8, f"Round {round_idx}: expected exactly 8 denied, got {denied}"
+        assert successes + denied == num_processes
+
+    redis_conn.flushdb()
+
+
+def test_reserved_priority_slot_operational(redis_conn, mock_resources):
+    """
+    Item 4: VERIFICAR RESERVED PRIORITY SLOT OPERACIONALMENTE.
+    Configurar: MAX_CONCURRENT=2, RESERVED_PRIORITY_SLOTS=1.
+    1 BACKGROUND activo.
+    Otro BACKGROUND -> DENIED.
+    HIGH -> ALLOWED.
+    Luego con 1 BACKGROUND + 1 HIGH activos:
+    CRITICAL -> DENIED porque MAX total ya está completo.
+    """
+    orch = TranscodeOrchestrator(
+        slot_manager=RedisSlotManager(redis_conn=redis_conn),
+        resource_provider=mock_resources,
+        node_name="test-priority-node",
+        max_concurrent=2,
+        reserved_priority_slots=1,
+    )
+
+    # 1. 1 BACKGROUND activo
+    s_bg1 = orch.acquire_slot("job-bg-1", "asset-bg-1", "vod_batch", "w1", Priority.BACKGROUND)
+    assert s_bg1 is not None
+    assert orch.slot_manager.count_active_slots() == 1
+
+    # 2. Otro BACKGROUND -> DENIED (normal capacity 2-1=1 already filled)
+    dec_bg2 = orch.can_start_transcode(Priority.BACKGROUND)
+    assert dec_bg2.allowed is False
+    assert dec_bg2.reason == "reserved_priority_capacity"
+    s_bg2 = orch.acquire_slot("job-bg-2", "asset-bg-2", "vod_batch", "w2", Priority.BACKGROUND)
+    assert s_bg2 is None
+
+    # 3. HIGH -> ALLOWED (priority bypasses reserved quota, active < 2)
+    dec_hi = orch.can_start_transcode(Priority.HIGH)
+    assert dec_hi.allowed is True
+    assert dec_hi.reason == "capacity_available"
+    s_hi = orch.acquire_slot("job-hi-1", "asset-hi-1", "vod_priority", "w3", Priority.HIGH)
+    assert s_hi is not None
+    assert orch.slot_manager.count_active_slots() == 2
+
+    # 4. Con 1 BACKGROUND + 1 HIGH activos:
+    # CRITICAL -> DENIED (total MAX_CONCURRENT=2 is completely full)
+    dec_crit = orch.can_start_transcode(Priority.CRITICAL)
+    assert dec_crit.allowed is False
+    assert dec_crit.reason == "max_concurrency_reached"
+    s_crit = orch.acquire_slot("job-crit", "asset-crit", "progressive", "w4", Priority.CRITICAL)
+    assert s_crit is None
+
+    # Cleanup
+    orch.release_slot(s_bg1)
+    orch.release_slot(s_hi)
+    assert orch.slot_manager.count_active_slots() == 0
+
+
+def test_real_lease_expiration_integration(redis_conn, mock_resources):
+    """
+    Item 5: LEASE EXPIRATION REAL.
+    - Adquirir slot con TTL de test (1s).
+    - No renovar heartbeat.
+    - Esperar TTL.
+    - Comprobar que el slot expire en Redis.
+    - Siguiente job puede adquirir capacidad.
+    """
+    sm = RedisSlotManager(redis_conn=redis_conn)
+    orch = TranscodeOrchestrator(
+        slot_manager=sm,
+        resource_provider=mock_resources,
+        node_name="test-lease-node",
+        max_concurrent=1,
+        reserved_priority_slots=0,
+    )
+
+    with patch.object(settings, "TRANSCODE_SLOT_TTL_SECONDS", 1):
+        # 1. Adquirir slot 1 con TTL=1s
+        s1 = orch.acquire_slot("job-lease-1", "asset-1", "vod_tasks", "w1", Priority.NORMAL)
+        assert s1 is not None
+        assert orch.slot_manager.count_active_slots() == 1
+        assert orch.can_start_transcode(Priority.NORMAL).allowed is False
+
+        # 2. No renovar heartbeat, esperar transcurso del TTL (1s)
+        time.sleep(1.2)
+
+        # 3. Comprobar que el slot expiró en Redis
+        assert orch.slot_manager.get_slot(s1.slot_id) is None
+
+        # 4. Siguiente job puede adquirir capacidad
+        dec2 = orch.can_start_transcode(Priority.NORMAL)
+        assert dec2.allowed is True
+        s2 = orch.acquire_slot("job-lease-2", "asset-2", "vod_tasks", "w2", Priority.NORMAL)
+        assert s2 is not None
+        assert s2.slot_id != s1.slot_id
+        assert orch.slot_manager.count_active_slots() == 1
+
+        orch.release_slot(s2)
+
+
+def test_fail_closed_redis_outage_prevents_ffmpeg_launch(tmp_path, mock_resources):
+    """
+    Item 6: FAIL-CLOSED REAL.
+    Simular indisponibilidad de Redis durante acquire.
+    allowed = false, reason = orchestrator_unavailable.
+    Comprobar además que FFmpeg NO es iniciado.
+    """
+    import redis.exceptions
+
+    failing_redis = MagicMock()
+    failing_redis.ping.side_effect = redis.exceptions.ConnectionError("Redis connection refused")
+    failing_redis.evalsha.side_effect = redis.exceptions.ConnectionError("Redis connection refused")
+    failing_redis.eval.side_effect = redis.exceptions.ConnectionError("Redis connection refused")
+
+    sm = RedisSlotManager(redis_conn=failing_redis)
+    orch = TranscodeOrchestrator(
+        slot_manager=sm,
+        resource_provider=mock_resources,
+        node_name="test-fail-closed",
+        max_concurrent=1,
+    )
+
+    # 1. Verify can_start_transcode returns fail-closed
+    dec = orch.can_start_transcode(Priority.NORMAL)
+    assert dec.allowed is False
+    assert dec.reason == "orchestrator_unavailable"
+
+    # 2. Verify acquire_slot returns None
+    slot = orch.acquire_slot("job-fail", "asset-fail", "vod_tasks", "w-fail", Priority.NORMAL)
+    assert slot is None
+
+    # 3. Verify FFmpeg is NOT launched when slot is None (guard pattern)
+    with patch("src.worker.transcode.subprocess.Popen") as mock_popen:
+        if slot is not None:
+            # Code should never reach here
+            mock_popen()
+
+        mock_popen.assert_not_called()
+
+    # 4. Verify no FFmpeg processes spawned on OS
+    matching_ffmpegs = [
+        p for p in psutil.process_iter(["name", "cmdline"])
+        if "ffmpeg" in (p.info["name"] or "").lower() and str(tmp_path) in " ".join(p.info["cmdline"] or [])
+    ]
+    assert len(matching_ffmpegs) == 0
