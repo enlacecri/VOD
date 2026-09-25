@@ -237,7 +237,8 @@ def execute_transcode(
     has_audio: bool,
     duration_sec: float,
     heartbeat_callback: Callable[[], None],
-    progress_callback: Callable[[int], None]
+    progress_callback: Callable[[int], None],
+    slot: Optional[Any] = None,
 ):
     encoder = get_best_encoder()
     
@@ -267,6 +268,12 @@ def execute_transcode(
             shell=False,
             start_new_session=True,
         )
+        if slot is not None:
+            try:
+                from src.services.transcode_orchestrator import transcode_orchestrator
+                transcode_orchestrator.update_slot_pid(slot, process.pid)
+            except Exception:
+                pass
         
         total_us = int(duration_sec * 1_000_000)
         

@@ -111,6 +111,10 @@ def test_isolation_storage_progressive(tmp_path, monkeypatch):
     assert session.session_dir.is_relative_to(prog_dir)
     assert "output" not in str(session.session_dir)
     assert "staging" not in str(session.session_dir)
+    for _ in range(20):
+        time.sleep(0.1)
+        if session.status in ["COMPLETED", "FAILED"]:
+            break
 
 def test_playable_threshold_and_available_duration(tmp_path):
     """7 & 8. PLAYABLE no ocurre antes de 5 segmentos y usa el mínimo común."""

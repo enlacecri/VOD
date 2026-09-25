@@ -21,6 +21,7 @@ from src.worker.transcode import (
     parse_ffmpeg_progress,
     TranscodeError
 )
+from src.services.transcode_orchestrator import transcode_orchestrator, Priority
 
 logger = logging.getLogger(__name__)
 
@@ -211,48 +212,74 @@ class ProgressiveSessionManager:
             session.save_auxiliary_state()
             return
 
-        # Create subdirectories for each variant
-        for k in selected_variants.keys():
-            (session_dir / k).mkdir(exist_ok=True)
+        # Acquire transcode capacity slot from Orchestrator (with short wait for on-demand playback)
+        slot = None
+        for _ in range(15):
+            slot = transcode_orchestrator.acquire_slot(
+                job_id=str(session.session_uuid),
+                asset_id=str(session.session_uuid),
+                queue="progressive",
+                worker_name="progressive_manager",
+                priority=Priority.CRITICAL,
+                profile="progressive_hls",
+                estimated_weight=1,
+            )
+            if slot is not None:
+                break
+            time.sleep(0.1)
 
-        # 4. Build FFmpeg command
-        args = build_transcode_args(
-            source_path=session.source_path,
-            output_dir=session_dir,
-            source_width=source_width,
-            source_height=source_height,
-            source_fps=source_fps,
-            has_audio=has_audio,
-            encoder=encoder,
-            selected_variants=selected_variants,
-            hls_playlist_type="event",
-            hls_flags="independent_segments+temp_file",
-            hls_list_size=0
-        )
+        if slot is None:
+            with session._lock:
+                session.status = "FAILED"
+                session.error_message = "No transcode capacity available"
+            logger.warning(f"[PROGRESSIVE] transcode capacity unavailable for session {session.session_uuid}")
+            session.save_auxiliary_state()
+            return
 
-        with open(session.log_path, "w") as log_file:
-            try:
-                process = subprocess.Popen(
-                    args,
-                    stdout=subprocess.PIPE,
-                    stderr=log_file,
-                    text=True,
-                    shell=False,
-                    start_new_session=True,
-                )
-                with session._lock:
-                    session.process = process
-                    session.started_at = datetime.now(timezone.utc)
-                    session.status = "PROCESSING"
-                logger.info(f"[PROGRESSIVE] ffmpeg started (pid={process.pid}) for session {session.session_uuid}")
-                session.save_auxiliary_state()
-            except Exception as e:
-                with session._lock:
-                    session.status = "FAILED"
-                    session.error_message = f"Failed to start FFmpeg: {str(e)}"
-                logger.error(f"[PROGRESSIVE] FFmpeg launch failed: {e}")
-                session.save_auxiliary_state()
-                return
+        try:
+            # Create subdirectories for each variant
+            for k in selected_variants.keys():
+                (session_dir / k).mkdir(exist_ok=True)
+
+            # 4. Build FFmpeg command
+            args = build_transcode_args(
+                source_path=session.source_path,
+                output_dir=session_dir,
+                source_width=source_width,
+                source_height=source_height,
+                source_fps=source_fps,
+                has_audio=has_audio,
+                encoder=encoder,
+                selected_variants=selected_variants,
+                hls_playlist_type="event",
+                hls_flags="independent_segments+temp_file",
+                hls_list_size=0
+            )
+
+            with open(session.log_path, "w") as log_file:
+                try:
+                    process = subprocess.Popen(
+                        args,
+                        stdout=subprocess.PIPE,
+                        stderr=log_file,
+                        text=True,
+                        shell=False,
+                        start_new_session=True,
+                    )
+                    transcode_orchestrator.update_slot_pid(slot, process.pid)
+                    with session._lock:
+                        session.process = process
+                        session.started_at = datetime.now(timezone.utc)
+                        session.status = "PROCESSING"
+                    logger.info(f"[PROGRESSIVE] ffmpeg started (pid={process.pid}) for session {session.session_uuid}")
+                    session.save_auxiliary_state()
+                except Exception as e:
+                    with session._lock:
+                        session.status = "FAILED"
+                        session.error_message = f"Failed to start FFmpeg: {str(e)}"
+                    logger.error(f"[PROGRESSIVE] FFmpeg launch failed: {e}")
+                    session.save_auxiliary_state()
+                    return
 
             # Read stdout asynchronously for progress
             out_queue = queue.Queue()
@@ -278,12 +305,18 @@ class ProgressiveSessionManager:
 
             total_us = int(duration_sec * 1_000_000)
             last_progress = 0.0
+            last_heartbeat = time.monotonic()
             master_pl_logged = False
             variant_pl_logged = set()
             known_segments: Dict[str, set] = {k: set() for k in selected_variants.keys()}
 
             # Monitoring loop
             while True:
+                now = time.monotonic()
+                if now - last_heartbeat > settings.TRANSCODE_HEARTBEAT_INTERVAL_SECONDS:
+                    transcode_orchestrator.heartbeat(slot)
+                    last_heartbeat = now
+
                 # 1. Drain progress lines from stdout
                 while True:
                     try:
@@ -401,6 +434,8 @@ class ProgressiveSessionManager:
                     logger.error(f"[PROGRESSIVE] failed for session {session.session_uuid}: {session.error_message}")
 
                 session.save_auxiliary_state()
+        finally:
+            transcode_orchestrator.release_slot(slot)
 
 
 # Global singleton manager for progressive sessions

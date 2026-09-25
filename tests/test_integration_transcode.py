@@ -55,6 +55,7 @@ def test_transcode_worker_integration(tmp_path, db_session, monkeypatch, fixture
     monkeypatch.setattr(settings, "STAGING_ROOT", str(staging))
     monkeypatch.setattr(settings, "OUTPUT_ROOT", str(output))
     monkeypatch.setattr(settings, "PROCESSED_ROOT", str(processed))
+    monkeypatch.setattr(settings, "TRANSCODE_RESOURCE_CHECK_ENABLED", False)
     
     # Record existing file state in real storage/processed to ensure we don't modify it
     real_processed_file = Path("storage/processed") / fixture_name

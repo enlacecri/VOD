@@ -539,6 +539,27 @@ cmd_repair_workers() {
     release_lock
 }
 
+cmd_transcodes() {
+    check_deps
+    if [ -f "src/scripts/transcode_cli.py" ]; then
+        "$VENV_PYTHON" src/scripts/transcode_cli.py status
+    else
+        die "src/scripts/transcode_cli.py no encontrado."
+    fi
+}
+
+cmd_transcodes_repair() {
+    check_deps
+    acquire_lock
+    info "Ejecutando reparación del Orquestador de Transcodificación..."
+    if [ -f "src/scripts/transcode_cli.py" ]; then
+        "$VENV_PYTHON" src/scripts/transcode_cli.py repair
+    else
+        die "src/scripts/transcode_cli.py no encontrado."
+    fi
+    release_lock
+}
+
 cmd_status() {
     check_deps
     
@@ -969,6 +990,8 @@ cmd_help() {
     echo "                  Uso: ./vod.sh workflow-retry <ASSET> <STEP_TYPE> [--force]"
     echo "  repair-workers  Reconcilia workers, limpia duplicados y stale PID/RQ records."
     echo "                  (Alias: workers-clean)"
+    echo "  transcodes      Muestra el estado, capacidad y métricas del Orquestador de Transcodificación."
+    echo "  transcodes-repair Repara slots stale y prunea llaves huérfanas en Redis."
     echo ""
     echo "Ejemplo completo:"
     echo "  cp /ruta/del/video/PREDI-MVIDA464.mp4 storage/input/"
@@ -1001,6 +1024,12 @@ case "$COMMAND" in
         ;;
     repair-workers|workers-clean)
         cmd_repair_workers
+        ;;
+    transcodes)
+        cmd_transcodes "$@"
+        ;;
+    transcodes-repair)
+        cmd_transcodes_repair "$@"
         ;;
     logs)
         cmd_logs "$@"
