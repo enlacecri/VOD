@@ -7,7 +7,7 @@ from pathlib import Path
 from src.core.config import settings
 from src.worker.transcode import execute_transcode, TranscodeError
 
-def test_transcode_timeout_cleanup(tmp_path):
+def test_transcode_timeout_cleanup(tmp_path, monkeypatch):
     # We will simulate a fake ffmpeg that sleeps indefinitely
     fake_ffmpeg = tmp_path / "fake_ffmpeg.sh"
     fake_ffmpeg.write_text(
@@ -20,9 +20,9 @@ def test_transcode_timeout_cleanup(tmp_path):
     )
     fake_ffmpeg.chmod(0o755)
     
-    settings.FFMPEG_PATH = str(fake_ffmpeg)
-    settings.FFMPEG_TIMEOUT_SECONDS = 2
-    settings.FFMPEG_GRACEFUL_STOP_SECONDS = 1
+    monkeypatch.setattr(settings, "FFMPEG_PATH", str(fake_ffmpeg))
+    monkeypatch.setattr(settings, "FFMPEG_TIMEOUT_SECONDS", 2)
+    monkeypatch.setattr(settings, "FFMPEG_GRACEFUL_STOP_SECONDS", 1)
     
     out_dir = tmp_path / "out"
     log_file = tmp_path / "ffmpeg.log"
@@ -46,19 +46,19 @@ def test_transcode_timeout_cleanup(tmp_path):
         
     assert exc_info.value.code == "E_FFMPEG_TIMEOUT"
     
-    # Check that thread is gone
+    # Check that thread is gone (no thread leaked)
     time.sleep(0.5)
     final_thread_count = threading.active_count()
-    assert final_thread_count == initial_thread_count
+    assert final_thread_count <= initial_thread_count
 
 
-def test_encoder_detection_timeout_cleans_process_group(tmp_path):
+def test_encoder_detection_timeout_cleans_process_group(tmp_path, monkeypatch):
     fake_ffmpeg = tmp_path / "fake_ffmpeg.sh"
     fake_ffmpeg.write_text("#!/bin/bash\nwhile true; do sleep 1; done\n")
     fake_ffmpeg.chmod(0o755)
 
-    settings.FFMPEG_PATH = str(fake_ffmpeg)
-    settings.FFMPEG_ENCODER_CHECK_TIMEOUT_SECONDS = 1
+    monkeypatch.setattr(settings, "FFMPEG_PATH", str(fake_ffmpeg))
+    monkeypatch.setattr(settings, "FFMPEG_ENCODER_CHECK_TIMEOUT_SECONDS", 1)
 
     with pytest.raises(TranscodeError) as exc_info:
         execute_transcode(

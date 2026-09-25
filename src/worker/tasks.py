@@ -4,12 +4,19 @@ from pathlib import Path
 from redis import Redis
 import time
 import subprocess
+import signal
 import queue
 import threading
 from uuid import UUID
 from datetime import datetime, timezone
 import logging
 import rq
+
+from src.services.transcode_orchestrator import (
+    transcode_orchestrator,
+    get_priority_for_queue,
+    Priority,
+)
 
 from src.core.database import SessionLocal
 from src.core.config import settings
@@ -320,22 +327,63 @@ def transcode_asset_job(job_id: UUID):
             # 1. Ensure clean job dir
             # job_hls_dir is created inside execute_transcode with exist_ok=False
             
-            job.heartbeat = datetime.now(timezone.utc)
-            db.commit()
+            # Request transcode slot from Orchestrator
+            target_queue = getattr(job, "queue_name", None) or settings.RQ_QUEUE_NAME
+            prio = get_priority_for_queue(target_queue)
+
+            slot = transcode_orchestrator.acquire_slot(
+                job_id=job.id,
+                asset_id=asset.id,
+                queue=target_queue,
+                worker_name=worker_id,
+                priority=prio,
+                profile="hls_ladder",
+                estimated_weight=1,
+            )
+
+            if slot is None:
+                logger.info(f"transcode.slot.waiting: Job {job.id} waiting for capacity. Backpressure rescheduling...")
+                job.status = JobStatus.PENDING
+                job.started_at = None
+                transition_asset(db, asset, VideoStatus.QUEUED)
+                db.commit()
+
+                if current_job:
+                    attempts = current_job.meta.get("transcode_backoff_attempts", 0)
+                    delay = transcode_orchestrator.get_retry_delay(attempt=attempts)
+                    current_job.meta["transcode_backoff_attempts"] = attempts + 1
+                    current_job.save_meta()
+
+                    try:
+                        from rq import Queue
+                        from datetime import timedelta
+                        q = Queue(name=target_queue, connection=transcode_orchestrator.slot_manager.redis)
+                        q.enqueue_in(
+                            timedelta(seconds=delay),
+                            transcode_asset_job,
+                            job_id,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to schedule backoff retry via RQ: {e}")
+                return
 
             # 2. Transcode
-            execute_transcode(
-                source_path=candidate,
-                output_dir=job_hls_dir,
-                log_path=log_path,
-                source_width=asset.source_width,
-                source_height=asset.source_height,
-                source_fps=asset.source_fps,
-                has_audio=asset.has_audio,
-                duration_sec=asset.duration_seconds,
-                heartbeat_callback=heartbeat_callback,
-                progress_callback=progress_callback
-            )
+            try:
+                execute_transcode(
+                    source_path=candidate,
+                    output_dir=job_hls_dir,
+                    log_path=log_path,
+                    source_width=asset.source_width,
+                    source_height=asset.source_height,
+                    source_fps=asset.source_fps,
+                    has_audio=asset.has_audio,
+                    duration_sec=asset.duration_seconds,
+                    heartbeat_callback=lambda: (heartbeat_callback(), transcode_orchestrator.heartbeat(slot)),
+                    progress_callback=lambda p: (progress_callback(p), transcode_orchestrator.update_slot_progress(slot, p)),
+                    slot=slot,
+                )
+            finally:
+                transcode_orchestrator.release_slot(slot)
             
             job.heartbeat = datetime.now(timezone.utc)
             db.commit()
@@ -567,133 +615,206 @@ def progressive_transcode_asset_job(job_id: UUID):
             db.commit()
             return
 
-        canonical_dir.mkdir(parents=True, exist_ok=True)
-        for k in selected_variants.keys():
-            (canonical_dir / k).mkdir(parents=True, exist_ok=True)
+        # Request transcode slot from Orchestrator
+        target_queue = getattr(job, "queue_name", None) or settings.RQ_QUEUE_NAME
+        prio = get_priority_for_queue(target_queue)
 
-        args = build_transcode_args(
-            source_path=source_path,
-            output_dir=canonical_dir,
-            source_width=asset.source_width,
-            source_height=asset.source_height,
-            source_fps=asset.source_fps or 30.0,
-            has_audio=asset.has_audio,
-            encoder=encoder,
-            selected_variants=selected_variants,
-            hls_playlist_type="event",
-            hls_flags="independent_segments+temp_file",
-            hls_list_size=0
+        slot = transcode_orchestrator.acquire_slot(
+            job_id=job.id,
+            asset_id=asset.id,
+            queue=target_queue,
+            worker_name=worker_id,
+            priority=prio,
+            profile="hls_ladder",
+            estimated_weight=1,
         )
 
-        with open(log_path, "w") as log_file:
-            process = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=log_file,
-                text=True,
-                shell=False,
-                start_new_session=True,
+        if slot is None:
+            logger.info(f"transcode.slot.waiting: Job {job.id} waiting for capacity. Backpressure rescheduling...")
+            job.status = JobStatus.PENDING
+            job.started_at = None
+            if asset.status == VideoStatus.PROCESSING:
+                transition_asset(db, asset, VideoStatus.QUEUED)
+            db.commit()
+
+            if current_job:
+                attempts = current_job.meta.get("transcode_backoff_attempts", 0)
+                delay = transcode_orchestrator.get_retry_delay(attempt=attempts)
+                current_job.meta["transcode_backoff_attempts"] = attempts + 1
+                current_job.save_meta()
+
+                try:
+                    from rq import Queue
+                    from datetime import timedelta
+                    q = Queue(name=target_queue, connection=transcode_orchestrator.slot_manager.redis)
+                    q.enqueue_in(
+                        timedelta(seconds=delay),
+                        progressive_transcode_asset_job,
+                        job_id,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to schedule backoff retry via RQ: {e}")
+            return
+
+        try:
+            canonical_dir.mkdir(parents=True, exist_ok=True)
+            for k in selected_variants.keys():
+                (canonical_dir / k).mkdir(parents=True, exist_ok=True)
+
+            args = build_transcode_args(
+                source_path=source_path,
+                output_dir=canonical_dir,
+                source_width=asset.source_width,
+                source_height=asset.source_height,
+                source_fps=asset.source_fps or 30.0,
+                has_audio=asset.has_audio,
+                encoder=encoder,
+                selected_variants=selected_variants,
+                hls_playlist_type="event",
+                hls_flags="independent_segments+temp_file",
+                hls_list_size=0
             )
 
-            out_queue = queue.Queue()
-            stop_event = threading.Event()
+            with open(log_path, "w") as log_file:
+                process = subprocess.Popen(
+                    args,
+                    stdout=subprocess.PIPE,
+                    stderr=log_file,
+                    text=True,
+                    shell=False,
+                    start_new_session=True,
+                )
+                transcode_orchestrator.update_slot_pid(slot, process.pid)
+                logger.info(f"transcode.started: job={job.id}, asset={asset.id}, pid={process.pid}")
 
-            def reader_thread(pipe, q, stop_ev):
-                try:
-                    for line in iter(pipe.readline, ''):
-                        if stop_ev.is_set():
-                            break
-                        q.put(line)
-                except Exception:
-                    pass
-                finally:
+                out_queue = queue.Queue()
+                stop_event = threading.Event()
+
+                def reader_thread(pipe, q, stop_ev):
                     try:
-                        pipe.close()
+                        for line in iter(pipe.readline, ''):
+                            if stop_ev.is_set():
+                                break
+                            q.put(line)
                     except Exception:
                         pass
-                    q.put(None)
+                    finally:
+                        try:
+                            pipe.close()
+                        except Exception:
+                            pass
+                        q.put(None)
 
-            t_reader = threading.Thread(target=reader_thread, args=(process.stdout, out_queue, stop_event), daemon=True)
-            t_reader.start()
+                t_reader = threading.Thread(target=reader_thread, args=(process.stdout, out_queue, stop_event), daemon=True)
+                t_reader.start()
 
-            total_us = int((asset.duration_seconds or 1.0) * 1_000_000)
-            last_heartbeat = time.monotonic()
-            last_db_persist = time.monotonic()
-            last_pct = 0
-            is_playable = False
+                total_us = int((asset.duration_seconds or 1.0) * 1_000_000)
+                start_monotonic = time.monotonic()
+                last_heartbeat = start_monotonic
+                last_db_persist = start_monotonic
+                last_pct = 0
+                is_playable = False
+                timeout_limit = settings.TRANSCODE_JOB_TIMEOUT_SECONDS or settings.FFMPEG_TIMEOUT_SECONDS
 
-            while True:
-                now = time.monotonic()
-
-                # Heartbeat every 5s
-                if now - last_heartbeat > settings.HEARTBEAT_INTERVAL_SECONDS:
-                    job.heartbeat = datetime.now(timezone.utc)
-                    db.commit()
-                    last_heartbeat = now
-
-                # Drain stdout lines for progress
                 while True:
-                    try:
-                        line = out_queue.get_nowait()
-                        if line is None:
+                    now = time.monotonic()
+
+                    # Timeout check
+                    if now - start_monotonic > timeout_limit:
+                        logger.error(f"transcode.timeout: Job {job.id} exceeded timeout {timeout_limit}s")
+                        if process.poll() is None:
+                            try:
+                                os.killpg(process.pid, signal.SIGTERM)
+                                process.wait(timeout=settings.FFMPEG_GRACEFUL_STOP_SECONDS)
+                            except (subprocess.TimeoutExpired, OSError):
+                                try:
+                                    os.killpg(process.pid, signal.SIGKILL)
+                                    process.wait(timeout=5)
+                                except OSError:
+                                    pass
+                        stop_event.set()
+                        t_reader.join(timeout=2.0)
+                        err_msg = truncate_error(f"FFmpeg exceeded timeout of {timeout_limit}s")
+                        fail_asset(db, asset, "transcode_timeout", err_msg)
+                        job.status = JobStatus.FAILED
+                        job.error_code = "transcode_timeout"
+                        job.error_message = err_msg
+                        job.finished_at = datetime.now(timezone.utc)
+                        db.commit()
+                        return
+
+                    # Heartbeat every interval (renew DB and Orchestrator lease)
+                    heartbeat_interval = min(settings.HEARTBEAT_INTERVAL_SECONDS, settings.TRANSCODE_HEARTBEAT_INTERVAL_SECONDS)
+                    if now - last_heartbeat > heartbeat_interval:
+                        job.heartbeat = datetime.now(timezone.utc)
+                        db.commit()
+                        transcode_orchestrator.heartbeat(slot)
+                        last_heartbeat = now
+
+                    # Drain stdout lines for progress
+                    while True:
+                        try:
+                            line = out_queue.get_nowait()
+                            if line is None:
+                                break
+                            us_done = parse_ffmpeg_progress(line)
+                            if us_done is not None and total_us > 0:
+                                pct = min(max(int((us_done / total_us) * 100), 0), 99)
+                                if pct > last_pct:
+                                    last_pct = pct
+                                    transcode_orchestrator.update_slot_progress(slot, last_pct)
+                        except queue.Empty:
                             break
-                        us_done = parse_ffmpeg_progress(line)
-                        if us_done is not None and total_us > 0:
-                            pct = min(max(int((us_done / total_us) * 100), 0), 99)
-                            if pct > last_pct:
-                                last_pct = pct
-                    except queue.Empty:
+
+                    # Count segments per variant
+                    counts: dict[str, int] = {}
+                    durs: dict[str, float] = {}
+                    for k in selected_variants.keys():
+                        v_pl = canonical_dir / k / "playlist.m3u8"
+                        c, d, _ = parse_variant_playlist(v_pl)
+                        counts[k] = c
+                        durs[k] = d
+
+                    if all(counts.get(k, 0) > 0 for k in selected_variants.keys()):
+                        min_dur = min(durs.values())
+                    else:
+                        min_dur = 0.0
+
+                    min_segments = settings.PROGRESSIVE_MIN_SEGMENTS
+                    if not is_playable and all(counts.get(k, 0) >= min_segments for k in selected_variants.keys()):
+                        is_playable = True
+                        asset.progress = last_pct
+                        asset.available_until_seconds = min_dur
+                        transition_asset(db, asset, VideoStatus.PLAYABLE, details={"available_until_seconds": min_dur, "segments": counts})
+                        db.commit()
+                        logger.info(f"Asset {asset.vod_uuid} is now PLAYABLE ({min_segments} segments, {min_dur:.1f}s)")
+                    elif now - last_db_persist > settings.PROGRESS_PERSIST_INTERVAL_SECONDS:
+                        asset.progress = last_pct
+                        asset.available_until_seconds = min_dur
+                        db.commit()
+                        last_db_persist = now
+
+                    if process.poll() is not None:
                         break
 
-                # Count segments per variant
-                counts: dict[str, int] = {}
-                durs: dict[str, float] = {}
-                for k in selected_variants.keys():
-                    v_pl = canonical_dir / k / "playlist.m3u8"
-                    c, d, _ = parse_variant_playlist(v_pl)
-                    counts[k] = c
-                    durs[k] = d
+                    time.sleep(0.5)
 
-                if all(counts.get(k, 0) > 0 for k in selected_variants.keys()):
-                    min_dur = min(durs.values())
-                else:
-                    min_dur = 0.0
+                stop_event.set()
+                t_reader.join(timeout=2.0)
+                returncode = process.wait()
 
-                min_segments = settings.PROGRESSIVE_MIN_SEGMENTS
-                if not is_playable and all(counts.get(k, 0) >= min_segments for k in selected_variants.keys()):
-                    is_playable = True
-                    asset.progress = last_pct
-                    asset.available_until_seconds = min_dur
-                    transition_asset(db, asset, VideoStatus.PLAYABLE, details={"available_until_seconds": min_dur, "segments": counts})
+                if returncode != 0:
+                    with open(log_path, "r") as lf:
+                        lines = lf.readlines()
+                        stderr_tail = "".join(lines[-20:]) if lines else "No stderr"
+                    err_msg = truncate_error(f"FFmpeg exit code {returncode}: {stderr_tail}")
+                    fail_asset(db, asset, "E_TRANSCODE_FAILED", err_msg)
+                    job.status = JobStatus.FAILED
+                    job.error_code = "E_TRANSCODE_FAILED"
+                    job.error_message = err_msg
+                    job.finished_at = datetime.now(timezone.utc)
                     db.commit()
-                    logger.info(f"Asset {asset.vod_uuid} is now PLAYABLE ({min_segments} segments, {min_dur:.1f}s)")
-                elif now - last_db_persist > settings.PROGRESS_PERSIST_INTERVAL_SECONDS:
-                    asset.progress = last_pct
-                    asset.available_until_seconds = min_dur
-                    db.commit()
-                    last_db_persist = now
-
-                if process.poll() is not None:
-                    break
-
-                time.sleep(0.5)
-
-            stop_event.set()
-            t_reader.join(timeout=2.0)
-            returncode = process.wait()
-
-            if returncode != 0:
-                with open(log_path, "r") as lf:
-                    lines = lf.readlines()
-                    stderr_tail = "".join(lines[-20:]) if lines else "No stderr"
-                err_msg = truncate_error(f"FFmpeg exit code {returncode}: {stderr_tail}")
-                fail_asset(db, asset, "E_TRANSCODE_FAILED", err_msg)
-                job.status = JobStatus.FAILED
-                job.error_code = "E_TRANSCODE_FAILED"
-                job.error_message = err_msg
-                job.finished_at = datetime.now(timezone.utc)
-                db.commit()
-                return
+                    return
 
             # Transition to VALIDATING
             transition_asset(db, asset, VideoStatus.VALIDATING)
@@ -706,7 +827,7 @@ def progressive_transcode_asset_job(job_id: UUID):
                     asset.duration_seconds,
                     asset.has_audio,
                     asset.source_width,
-                    asset.source_height
+                    asset.source_height,
                 )
 
                 for v_name, v_meta in validated_renditions.items():
@@ -770,6 +891,8 @@ def progressive_transcode_asset_job(job_id: UUID):
                 job.error_message = err_msg
                 job.finished_at = datetime.now(timezone.utc)
                 db.commit()
+        finally:
+            transcode_orchestrator.release_slot(slot)
 
     except Exception as e:
         logger.exception(f"Unexpected error in progressive worker for job {job_id}")

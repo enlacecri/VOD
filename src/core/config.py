@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings
-from typing import Optional
+from pydantic import field_validator
+from typing import Optional, Any
 
 class Settings(BaseSettings):
     VOD_POSTGRES_PORT: int = 5434
@@ -66,6 +67,36 @@ class Settings(BaseSettings):
     VOD_INGEST_STABLE_SECONDS: int = 30
     VOD_SUBTITLE_LANGUAGES: str = "es,en"
     VOD_BACKUP_STORAGE_DIR: str = "./storage/backup"
+
+    # Phase 6 Settings (Smart Transcode Orchestrator)
+    TRANSCODE_ORCHESTRATOR_ENABLED: bool = True
+    TRANSCODE_NODE_NAME: str = ""
+    TRANSCODE_MAX_CONCURRENT: int = 1
+    TRANSCODE_RESERVED_PRIORITY_SLOTS: int = 0
+    TRANSCODE_CPU_START_THRESHOLD: float = 75.0
+    TRANSCODE_CPU_HARD_THRESHOLD: float = 90.0
+    TRANSCODE_MIN_AVAILABLE_MEMORY_MB: int = 2048
+    TRANSCODE_MIN_FREE_DISK_GB: int = 5
+    TRANSCODE_RESOURCE_CHECK_ENABLED: bool = True
+    TRANSCODE_SLOT_TTL_SECONDS: int = 60
+    TRANSCODE_HEARTBEAT_INTERVAL_SECONDS: int = 20
+    TRANSCODE_RETRY_MIN_SECONDS: int = 5
+    TRANSCODE_RETRY_MAX_SECONDS: int = 30
+    TRANSCODE_JOB_TIMEOUT_SECONDS: Optional[int] = None
+
+    @field_validator("TRANSCODE_JOB_TIMEOUT_SECONDS", mode="before")
+    @classmethod
+    def parse_optional_timeout(cls, v: Any) -> Optional[int]:
+        if v == "" or v is None:
+            return None
+        return int(v)
+
+    @property
+    def resolved_node_name(self) -> str:
+        if self.TRANSCODE_NODE_NAME and self.TRANSCODE_NODE_NAME.strip():
+            return self.TRANSCODE_NODE_NAME.strip()
+        import socket
+        return socket.gethostname()
 
     @property
     def normalized_cdn_url(self) -> str:

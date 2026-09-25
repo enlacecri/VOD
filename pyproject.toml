@@ -16,7 +16,8 @@ dependencies = [
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "redis>=5.0",
-    "rq>=1.15"
+    "rq>=1.15",
+    "psutil>=5.9.0"
 ]
 
 [project.optional-dependencies]
